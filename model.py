@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+torch.set_printoptions(sci_mode=False, precision=4)
+
 # =====================================================================
 # 1. 기본 레이어 및 모듈 정의 (Conv, C2f, SPPF)
 # =====================================================================
@@ -52,11 +54,11 @@ class C2f(nn.Module):
 
 
 class SPPF(nn.Module):
-    def __init__(self, c1, c2, k=5):
+    def __init__(self, in_channels, out_channels, k=5):
         super().__init__()
-        c_ = c1 // 2
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        c_ = in_channels // 2
+        self.cv1 = Conv(in_channels, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, out_channels, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
@@ -198,7 +200,7 @@ class DualYOLOv8PoseModel(nn.Module):
         p5_down_fuse = self.cv_p5_down(torch.cat([p4_down, x_p5_raw], dim=1))
         p5_out = self.c2f_p5_down(p5_down_fuse)
 
-        final_features = [p3_out, p4_out, p5_out]
+        final_features = [p3_out, p4_out, p5_out]  # 8, 16, 32 strides
 
         if self.training:
             return self.one2many_head(final_features), self.one2one_head(final_features)

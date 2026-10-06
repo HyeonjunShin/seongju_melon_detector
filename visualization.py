@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from datasets import ChamaePoseDataset, find_melon_data, split_data
+from datasets import ChamaePackDataset, find_melon_data, split_data
 from model import DualYOLOv8PoseModel, CombinedPoseModel
 
 
@@ -45,7 +45,7 @@ def visualize_predictions(
 
     random.seed(seed)
     sample_paths = random.sample(val_paths, min(num_samples, len(val_paths)))
-    val_dataset = ChamaePoseDataset(sample_paths, is_train=False)
+    val_dataset = ChamaePackDataset(sample_paths, is_train=False)
 
     COLOR_GT_BOX = (0, 255, 0)
     COLOR_GT_KNOT = (255, 0, 255)

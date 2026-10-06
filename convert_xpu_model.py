@@ -6,8 +6,8 @@ from openvino.preprocess import PrePostProcessor, ResizeAlgorithm, PaddingMode
 
 # 구축한 최신 모듈 임포트
 from datasets import (
-    ChamaePoseDataset,
-    chamae_pose_collate_fn,
+    ChamaePackDataset,
+    chamae_pack_collate_fn,
     find_melon_data,
     split_data,
 )
@@ -21,12 +21,12 @@ save_dir = "./runs/quantization"
 paired_path = find_melon_data(data_dir)
 train_path, _ = split_data(paired_path, train_ratio=0.9, seed=42)
 
-dataset = ChamaePoseDataset(train_path, is_train=False)  # Data Augmentation 비활성화
+dataset = ChamaePackDataset(train_path, is_train=False)  # Data Augmentation 비활성화
 data_loader = DataLoader(
     dataset,
     batch_size=1,
     shuffle=True,
-    collate_fn=chamae_pose_collate_fn,
+    collate_fn=chamae_pack_collate_fn,
     num_workers=4,
 )
 
