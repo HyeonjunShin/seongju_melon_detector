@@ -69,12 +69,7 @@ class SPPF(nn.Module):
         return self.cv2(torch.cat((x, y1, y2, y3), 1))
 
 
-# =====================================================================
-# 2. YOLOv8 Pose Head (Class, BBox, Keypoints 예측)
-# =====================================================================
-
-
-class StandardYOLOv8PoseHead(nn.Module):
+class PoseHead(nn.Module):
     def __init__(
         self, ch_channels=[64, 128, 256], num_classes=1, reg_max=16, num_kpts=2
     ):
@@ -123,12 +118,7 @@ class StandardYOLOv8PoseHead(nn.Module):
         return cls_all, reg_all, kpt_all
 
 
-# =====================================================================
-# 3. 메인 Pose 감지 모델 (Backbone + Neck + Dual Pose Head)
-# =====================================================================
-
-
-class DualYOLOv8PoseModel(nn.Module):
+class PoseModel(nn.Module):
     def __init__(self, num_classes=1, reg_max=16, num_kpts=2):
         super().__init__()
 
@@ -162,13 +152,13 @@ class DualYOLOv8PoseModel(nn.Module):
         self.c2f_p5_down = C2f(256, 256, n=1, shortcut=False)
 
         # Dual Assignment Head
-        self.one2many_head = StandardYOLOv8PoseHead(
+        self.one2many_head = PoseHead(
             ch_channels=[64, 128, 256],
             num_classes=num_classes,
             reg_max=reg_max,
             num_kpts=num_kpts,
         )
-        self.one2one_head = StandardYOLOv8PoseHead(
+        self.one2one_head = PoseHead(
             ch_channels=[64, 128, 256],
             num_classes=num_classes,
             reg_max=reg_max,
@@ -208,29 +198,23 @@ class DualYOLOv8PoseModel(nn.Module):
             return self.one2one_head(final_features)
 
 
-# =====================================================================
-# 4. Decoder Module (BBox Center & Size 기준 상대 거리 복원)
-# =====================================================================
-
-
-class PoseDecoderModule(nn.Module):
-    def __init__(self, reg_max=16, num_kpts=2, strides=[8, 16, 32]):
+class DecodeModule(nn.Module):
+    def __init__(self, reg_max=16, num_kpts=2, strides=[8, 16, 32], h=384, w=640):
         super().__init__()
         self.reg_max = reg_max
         self.num_kpts = num_kpts
-        self.strides_list = strides
 
-        # DFL Softmax용 가중치 [16]
+        # DFL Softmax 가중치 [16]
         self.proj = nn.Parameter(
             torch.arange(reg_max, dtype=torch.float32), requires_grad=False
         )
 
-        # 5040개 Anchor 및 Stride 사전 생성 (384x640 해상도 기준)
-        anchors, stride_tensor = self._generate_anchors(strides, h=384, w=640)
-        self.register_buffer("anchors", anchors)  # [5040, 2] (grid_x, grid_y)
+        # 5040개 Anchor 및 Stride 미리 생성하여 버퍼로 등록 (GPU 상주 및 재계산 방지)
+        anchors, stride_tensor = self._generate_anchors(strides, h=h, w=w)
+        self.register_buffer("anchors", anchors)  # [5040, 2]
         self.register_buffer("stride_tensor", stride_tensor)  # [5040, 1]
 
-    def _generate_anchors(self, strides, h=384, w=640):
+    def _generate_anchors(self, strides, h, w):
         anchor_list = []
         stride_list = []
 
@@ -252,42 +236,32 @@ class PoseDecoderModule(nn.Module):
 
         return torch.cat(anchor_list, dim=0), torch.cat(stride_list, dim=0)
 
-    def forward(self, cls_pred, reg_pred, kpt_pred):
+    def forward(self, reg_pred, kpt_pred):
         """
-        cls_pred: [B, 5040, 1] (Raw Logit)
-        reg_pred: [B, 5040, 64] (4 * reg_max)
-        kpt_pred: [B, 5040, 6]  (2 * 3: dx, dy, vis_logit)
+        reg_pred: [B, 5040, 64]  (BBox DFL Raw Output)
+        kpt_pred: [B, 5040, 6]   (Keypoint Rel Offset + Vis Logit)
+        반환:
+        - decoded_bboxes: [B, 5040, 4]    (픽셀 좌표: x1, y1, x2, y2)
+        - decoded_kpts:   [B, 5040, 2, 2] (픽셀 좌표: x, y)
+        - vis_logits:     [B, 5040, 2]    (Visibility Logits)
         """
-        batch_size = cls_pred.size(0)
+        B = reg_pred.size(0)
 
-        # 1. Class Score: Sigmoid 명시적 수행 [B, 5040, 1]
-        scores = torch.sigmoid(cls_pred)
-
-        # 2. BBox Distances DFL 계산 [B, 5040, 4]
-        reg_dist = reg_pred.view(batch_size, -1, 4, self.reg_max)
-        reg_dist = reg_dist.softmax(dim=-1) @ self.proj  # [B, 5040, 4]
-
-        # Distance * Stride -> Real Pixel Distance
+        # 1. BBox DFL 디코딩 (Distances -> Real Pixel BBox)
+        reg_dist = reg_pred.view(B, -1, 4, self.reg_max).softmax(dim=-1) @ self.proj
         lt = reg_dist[..., :2] * self.stride_tensor
         rb = reg_dist[..., 2:] * self.stride_tensor
 
-        # Anchor Pixel Center [5040, 2]
-        anchor_pixel = self.anchors * self.stride_tensor  # [5040, 2]
+        anchor_pixel = self.anchors * self.stride_tensor
+        decoded_bboxes = torch.cat([anchor_pixel - lt, anchor_pixel + rb], dim=-1)
 
-        # Decode BBoxes (x1, y1, x2, y2)
-        x1y1 = anchor_pixel - lt
-        x2y2 = anchor_pixel + rb
-        decoded_bboxes = torch.cat([x1y1, x2y2], dim=-1)  # [B, 5040, 4]
-
-        # 3. Keypoints Decode (차원 확장 적용)
-        # kpt_pred: [B, 5040, 6] -> [B, 5040, 2, 3]
-        kpt_reshaped = kpt_pred.view(batch_size, -1, self.num_kpts, 3)
-
+        # 2. Keypoint 디코딩 (BBox Center & Dimensions 재활용)
+        kpt_reshaped = kpt_pred.view(B, -1, self.num_kpts, 3)
         pred_rel_x = kpt_reshaped[..., 0:1]  # [B, 5040, 2, 1]
         pred_rel_y = kpt_reshaped[..., 1:2]  # [B, 5040, 2, 1]
-        pred_vis_logit = kpt_reshaped[..., 2:3]  # [B, 5040, 2, 1]
+        vis_logits = kpt_reshaped[..., 2]  # [B, 5040, 2]
 
-        # BBox Center & Dimensions
+        # BBox 중심점 및 크기 추출
         bbox_xc = (
             decoded_bboxes[..., 0:1] + decoded_bboxes[..., 2:3]
         ) * 0.5  # [B, 5040, 1]
@@ -301,22 +275,12 @@ class PoseDecoderModule(nn.Module):
             min=1.0
         )  # [B, 5040, 1]
 
-        # 💡 [핵심 해결]: unsqueeze(-1)로 [B, 5040, 1, 1] 형태로 만들어 Broadcasting 허용
-        bbox_xc_exp = bbox_xc.unsqueeze(-1)
-        bbox_yc_exp = bbox_yc.unsqueeze(-1)
-        bbox_w_exp = bbox_w.unsqueeze(-1)
-        bbox_h_exp = bbox_h.unsqueeze(-1)
-
         # Absolute Keypoint XY = BBox Center + (Relative Offset * BBox Width/Height)
-        abs_kpt_x = bbox_xc_exp + (pred_rel_x * bbox_w_exp)  # [B, 5040, 2, 1]
-        abs_kpt_y = bbox_yc_exp + (pred_rel_y * bbox_h_exp)  # [B, 5040, 2, 1]
+        abs_kpt_x = bbox_xc.unsqueeze(-1) + (pred_rel_x * bbox_w.unsqueeze(-1))
+        abs_kpt_y = bbox_yc.unsqueeze(-1) + (pred_rel_y * bbox_h.unsqueeze(-1))
+        decoded_kpts = torch.cat([abs_kpt_x, abs_kpt_y], dim=-1)  # [B, 5040, 2, 2]
 
-        abs_kpt_xy = torch.cat([abs_kpt_x, abs_kpt_y], dim=-1)  # [B, 5040, 2, 2]
-        decoded_kpts = torch.cat(
-            [abs_kpt_xy, pred_vis_logit], dim=-1
-        )  # [B, 5040, 2, 3]
-
-        return scores, decoded_bboxes, decoded_kpts
+        return decoded_bboxes, decoded_kpts, vis_logits
 
 
 # =====================================================================
@@ -324,15 +288,26 @@ class PoseDecoderModule(nn.Module):
 # =====================================================================
 
 
-class CombinedPoseModel(nn.Module):
-    def __init__(self, base_model, reg_max=16, num_kpts=2):
+class CombinedModel(nn.Module):
+    def __init__(
+        self, base_model, reg_max=16, num_kpts=2, strides=[8, 16, 32], h=384, w=640
+    ):
         super().__init__()
         self.base_model = base_model
-        self.decoder = PoseDecoderModule(reg_max=reg_max, num_kpts=num_kpts)
+        self.decoder = DecodeModule(
+            reg_max=reg_max, num_kpts=num_kpts, strides=strides, h=h, w=w
+        )
 
     def forward(self, x):
         cls_pred, reg_pred, kpt_pred = self.base_model(x)
-        return self.decoder(cls_pred, reg_pred, kpt_pred)
+
+        scores = torch.sigmoid(cls_pred)
+
+        decoded_bboxes, decoded_kpts, vis_logits = self.decoder(reg_pred, kpt_pred)
+
+        vis_probs = torch.sigmoid(vis_logits)
+
+        return scores, decoded_bboxes, decoded_kpts, vis_probs
 
 
 # =====================================================================
@@ -342,15 +317,15 @@ class CombinedPoseModel(nn.Module):
 if __name__ == "__main__":
     dummy_input = torch.randn(1, 3, 384, 640)
 
-    base_model = DualYOLOv8PoseModel(num_classes=1, reg_max=16, num_kpts=2)
-    export_model = CombinedPoseModel(base_model).eval()
+    base_model = PoseModel(num_classes=1, reg_max=16, num_kpts=2)
+    export_model = CombinedModel(base_model).eval()
 
     with torch.no_grad():
-        scores, bboxes, keypoints = export_model(dummy_input)
+        scores, bboxes, kps, vis = export_model(dummy_input)
 
     print("⚡ [검증 완료] Combined Model 출력 확인:")
     print(" - Scores Shape   :", scores.shape)  # [1, 5040, 1]
     print(" - BBoxes Shape   :", bboxes.shape)  # [1, 5040, 4]
-    print(
-        " - Keypoints Shape:", keypoints.shape
-    )  # [1, 5040, 2, 3] -> (Knot, Body) x (x, y, vis)
+    print(" - Keypoints Shape:", kps.shape)
+    print(" - Visibility Shape:", vis.shape)
+    # [1, 5040, 2, 3] -> (Knot, Body) x (x, y, vis)

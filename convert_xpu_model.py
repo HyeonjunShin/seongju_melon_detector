@@ -1,3 +1,4 @@
+import os
 import nncf
 import openvino as ov
 import torch
@@ -11,13 +12,14 @@ from datasets import (
     find_melon_data,
     split_data,
 )
-from model import DualYOLOv8PoseModel, CombinedPoseModel
+from model import PoseModel, CombinedModel
 
 # =====================================================================
 # 1. Calibration 데이터셋 준비 (200장)
 # =====================================================================
 data_dir = "./data"
 save_dir = "./runs/quantization"
+os.makedirs(save_dir, exist_ok=True)
 paired_path = find_melon_data(data_dir)
 train_path, _ = split_data(paired_path, train_ratio=0.9, seed=42)
 
@@ -47,10 +49,10 @@ print(
 device = torch.device("cpu")
 
 # CombinedPoseModel (Decoder 포함)
-base_model = DualYOLOv8PoseModel(num_classes=1, reg_max=16, num_kpts=2)
-model = CombinedPoseModel(base_model, reg_max=16, num_kpts=2).to(device)
+base_model = PoseModel(num_classes=1, reg_max=16, num_kpts=2)
+model = CombinedModel(base_model, reg_max=16, num_kpts=2).to(device)
 
-checkpoint_path = "./runs/train/best_combined.pt"
+checkpoint_path = "./runs/train/best_fixed.pt"
 ckpt = torch.load(checkpoint_path, map_location=device)
 if "model_state_dict" in ckpt:
     model.base_model.load_state_dict(ckpt["model_state_dict"])
@@ -102,4 +104,5 @@ ppp.input().preprocess().resize(
 quantized_model = ppp.build()
 
 ov.save_model(quantized_model, f"{save_dir}/model_int8.xml")
-print("✅ 3단계: 전처리가 내장된 INT8 모델 양자화 완료! (model_int8.xml)")
+ov.save_model(quantized_model, "./model_int8.xml")
+print("✅ 3단계: 전처리가 내장된 INT8 모델 양자화 완료! (runs/quantization/model_int8.xml 및 ./model_int8.xml)")
