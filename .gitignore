@@ -217,6 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+Log/
 data/
 runs/
 *.pt
