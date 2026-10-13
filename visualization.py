@@ -10,9 +10,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from datasets import ChamaePackDataset, find_melon_data, split_data
-from model import DualYOLOv8PoseModel, CombinedPoseModel
-
+from datasets import (
+    ChamaePackDataset,
+    find_melon_data,
+    split_data,
+    chamae_pack_collate_fn,
+)
+from model import Model, CombinedModel
 
 @torch.no_grad()
 def visualize_predictions(
@@ -29,8 +33,8 @@ def visualize_predictions(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    base_model = DualYOLOv8PoseModel(num_classes=1, reg_max=16, num_kpts=2)
-    model = CombinedPoseModel(base_model, reg_max=16, num_kpts=2).to(device)
+    base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
+    model = CombinedModel(base_model, reg_max=16, num_kpts=2).to(device)
 
     ckpt = torch.load(model_path, map_location=device)
     if "model_state_dict" in ckpt:
@@ -58,16 +62,16 @@ def visualize_predictions(
     print(f"\n🎨 시각화 작업 시작...")
 
     for idx in range(len(sample_paths)):
-        img_tensor, labels, gt_bboxes, gt_kpts = val_dataset[idx]
+        img_tensor, cls_tensor, bbox_tensor, kp_tensor, vis_tensor = val_dataset[idx]
         image_path, _ = sample_paths[idx]
 
         input_tensor = img_tensor.unsqueeze(0).to(device)
 
-        scores, decoded_bboxes, decoded_kpts = model(input_tensor)
+        pred_scores, pred_decoded_bboxes, pred_decoded_kpts, pred_visibility  = model(input_tensor)
 
-        scores_b = scores[0].squeeze(-1)  # [5040]
-        bboxes_b = decoded_bboxes[0]  # [5040, 4]
-        kpts_b = decoded_kpts[0]  # [5040, 2, 3]
+        scores_b = pred_scores.squeeze()  # [5040]
+        bboxes_b = pred_decoded_bboxes[0]  # [5040, 4]
+        kpts_b = pred_decoded_kpts[0]  # [5040, 2, 3]
 
         num_gt = len(gt_bboxes)
         top_k = max(num_gt, 1)
@@ -205,9 +209,9 @@ def visualize_predictions(
 
 if __name__ == "__main__":
     visualize_predictions(
-        model_path="./runs/train/best_combined.pt",
+        model_path="./runs/train/best_fixed.pt",
         data_dir="./data",
-        output_dir="./runs/visualizations",
+        output_dir="./runs/vis_test",
         num_samples=10,
         conf_thresh=0.25,
         seed=42,

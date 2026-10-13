@@ -213,7 +213,8 @@ class Detector:
         # PrePostProcessor가 전처리를 완료한 포즈 모델의 출력 바인딩
         self.output_scores = self.compiled_model.output(0)  # [1, 5040, 1]
         self.output_bboxes = self.compiled_model.output(1)  # [1, 5040, 4]
-        self.output_kpts = self.compiled_model.output(2)  # [1, 5040, 2, 3]
+        self.output_kpts = self.compiled_model.output(2)  # [1, 5040, 2, 2]
+        self.output_vis = self.compiled_model.output(3)  # [1, 5040, 2, 2]
 
     def detect(self, color_img):
         """color_img: (720, 1280, 3) Raw Camera Frame (u8, NHWC)
@@ -224,7 +225,8 @@ class Detector:
 
         scores = results[self.output_scores][0].squeeze(-1)  # [5040]
         bboxes = results[self.output_bboxes][0]  # [5040, 4]
-        kpts = results[self.output_kpts][0]  # [5040, 2, 3]
+        kpts = results[self.output_kpts][0]  # [5040, 2, 2]
+        vis = results[self.output_vis][0]  # [5040, 2, 2]
 
         # NMS-Free 방식: 가장 점수가 높은 Top-1 앵커 선택
         best_idx = np.argmax(scores)
@@ -238,7 +240,7 @@ class Detector:
             best_idx
         ]  # [[knot_x, knot_y, knot_vis_logit], [body_x, body_y, body_vis_logit]]
 
-        return float(best_score), best_bbox, best_kpt
+        return float(best_score), best_bbox, best_kpt, vis
 
 
 def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
@@ -342,3 +344,87 @@ def compute_pose_with_kpts(depth_img, kpts, K, DIST_COEFFS, vis_thresh=0.5):
     quaternion = r.as_quat()  # SciPy 순서: [qx, qy, qz, qw]
 
     return centroid, quaternion
+
+is_running = True
+def main():
+    import signal
+    import posix_ipc
+    from camera.buffer import CameraShm
+    from camera.gemini336 import color_shape, depth_shape
+    from camera.camera_runner import SHM_NAME, SEM_NAME
+    import torch
+
+    global is_running
+
+    def signal_handler(signum, frame):
+        global is_running
+        print("\n🛑 [Detection Process] 종료 신호를 수신했습니다...")
+        is_running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        camera_shm = CameraShm(
+            shm_name=SHM_NAME,
+            is_owner=False,
+            color_shape=color_shape,
+            depth_shape=depth_shape,
+        )
+    except FileNotFoundError:
+        print(
+            f"❌ [Error] Shared Memory ({SHM_NAME})를 찾을 수 없습니다. camera_runner_2.py를 먼저 실행하세요."
+        )
+        return
+
+    try:
+        camera_sem = posix_ipc.Semaphore(SEM_NAME)
+    except posix_ipc.ExistError:
+        print(f"❌ [Error] Semaphore ({SEM_NAME})를 찾을 수 없습니다.")
+        camera_shm.close()
+        return
+
+    detector = Detector()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    last_sequence_id = 0
+    try:
+        while is_running:
+            try:
+                camera_sem.acquire(timeout=1.0)
+            except posix_ipc.BusyError:
+                continue
+
+            if not camera_shm.status:
+                continue
+
+            current_seq = camera_shm.sequence_id
+            if current_seq <= last_sequence_id:
+                continue
+            last_sequence_id = current_seq
+
+            current_frame = camera_shm.read()
+
+            timestamp = current_frame.timestamp
+            color = current_frame.color.copy()
+            depth = current_frame.depth.copy()
+
+            score, bbox, kpts, vis = detector.detect(color)
+            print(score)
+
+    except KeyboardInterrupt:
+        print("\n[알림] Ctrl + C 입력으로 중단되었습니다.")
+
+    finally:
+        print("🛑 리소스 해제 중...")
+        cv2.destroyAllWindows()
+        camera_shm.close()
+        try:
+            camera_sem.close()
+        except Exception:
+            pass
+        print("✅ [Detection Process] 정상 종료되었습니다.")
+
+
+if __name__ == "__main__":
+    main()

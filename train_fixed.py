@@ -1,5 +1,6 @@
 import os
 import time
+import tempfile
 from pathlib import Path
 import numpy as np
 import cv2
@@ -12,82 +13,39 @@ from torch.utils.data import DataLoader
 from torchvision.ops import box_iou
 from tqdm import tqdm
 
-from datasets_fixed import (
+from datasets import (
     ChamaePackDataset,
+    chamae_pack_collate_fn,
     find_melon_data,
     split_data,
 )
-from model import PoseModel
-from anchors import generate_anchors
+from model import DecodeModule, Model
+
+KEYPOINT_DECODE_VERSION = "anchor_stride_v1"
+TRAINING_ASSIGNMENT_VERSION = "multi_gt_tal_v3_bgweight"
 
 
-def decode_regs(pred_regs, anchor_points, anchor_strides, reg_max=16):
-    """
-    Distribution Regression 출력을 픽셀 좌표 (xmin, ymin, xmax, ymax)로 디코딩
-    - pred_regs:       [B, 5040, 4 * reg_max]
-    - anchor_points:   [1, 5040, 2] (cx, cy)
-    - anchor_strides:  [1, 5040, 1]
-    """
-    weight = torch.arange(reg_max, dtype=torch.float32, device=pred_regs.device)
-    pred_regs = pred_regs.view(-1, 5040, 4, reg_max)
-    pred_regs = torch.softmax(pred_regs, dim=-1)
+def save_checkpoint_atomic(checkpoint, path):
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
 
-    dist_pixel = (pred_regs @ weight) * anchor_strides.view(1, -1, 1)
-
-    cx = anchor_points[..., 0]
-    cy = anchor_points[..., 1]
-
-    xmin = cx - dist_pixel[..., 0]
-    ymin = cy - dist_pixel[..., 1]
-    xmax = cx + dist_pixel[..., 2]
-    ymax = cy + dist_pixel[..., 3]
-
-    decoded_bboxes = torch.stack([xmin, ymin, xmax, ymax], dim=-1)
-    return decoded_bboxes
-
-
-def decode_keypoints(kpt_preds, decoded_bboxes, num_kpts=2):
-    """
-    상대 오프셋 키포인트 출력을 절대 픽셀 좌표로 디코딩
-    - kpt_preds:      [B, 5040, num_kpts * 3] -> (dx, dy, vis_logit) x num_kpts
-    - decoded_bboxes: [B, 5040, 4] -> (xmin, ymin, xmax, ymax)
-    반환:
-    - abs_kpts:       [B, 5040, num_kpts, 2] (pixels: x, y)
-    - vis_logits:     [B, 5040, num_kpts]
-    """
-    B = kpt_preds.size(0)
-    kpt_reshaped = kpt_preds.view(B, -1, num_kpts, 3)
-    pred_rel_xy = kpt_reshaped[..., :2]  # [B, 5040, num_kpts, 2]
-    vis_logits = kpt_reshaped[..., 2]  # [B, 5040, num_kpts]
-
-    bbox_xc = (
-        decoded_bboxes[..., 0:1] + decoded_bboxes[..., 2:3]
-    ) * 0.5  # [B, 5040, 1]
-    bbox_yc = (
-        decoded_bboxes[..., 1:2] + decoded_bboxes[..., 3:4]
-    ) * 0.5  # [B, 5040, 1]
-    bbox_w = (decoded_bboxes[..., 2:3] - decoded_bboxes[..., 0:1]).clamp(min=1.0)
-    bbox_h = (decoded_bboxes[..., 3:4] - decoded_bboxes[..., 1:2]).clamp(min=1.0)
-
-    abs_kpt_x = bbox_xc.unsqueeze(-1) + (pred_rel_xy[..., 0:1] * bbox_w.unsqueeze(-1))
-    abs_kpt_y = bbox_yc.unsqueeze(-1) + (pred_rel_xy[..., 1:2] * bbox_h.unsqueeze(-1))
-    abs_kpts = torch.cat([abs_kpt_x, abs_kpt_y], dim=-1)  # [B, 5040, num_kpts, 2]
-
-    return abs_kpts, vis_logits
+    try:
+        torch.save(checkpoint, temp_path)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def compute_ciou_loss(pred_bboxes, target_bboxes, eps=1e-7):
     """
-    미분 가능한 표준 CIoU Loss 계산
-    - pred_bboxes:   [B, 5040, 4]  -> (xmin, ymin, xmax, ymax)
-    - target_bboxes: [B, 1, 4]     -> (xmin, ymin, xmax, ymax)
-    반환 Shape: [B, 5040] (1.0 - ciou)
+    매칭된 예측/정답 bbox 쌍의 CIoU loss 계산.
+    입력 shape: [..., 4] -> 출력 shape: [...]
     """
-    b1 = pred_bboxes.unsqueeze(1)  # [B, 1, 5040, 4]
-    b2 = target_bboxes.unsqueeze(2)  # [B, 1, 1, 4]
-
-    b1_x1, b1_y1, b1_x2, b1_y2 = b1[..., 0], b1[..., 1], b1[..., 2], b1[..., 3]
-    b2_x1, b2_y1, b2_x2, b2_y2 = b2[..., 0], b2[..., 1], b2[..., 2], b2[..., 3]
+    b1_x1, b1_y1, b1_x2, b1_y2 = pred_bboxes.unbind(-1)
+    b2_x1, b2_y1, b2_x2, b2_y2 = target_bboxes.unbind(-1)
 
     w1 = (b1_x2 - b1_x1).clamp(min=eps)
     h1 = (b1_y2 - b1_y1).clamp(min=eps)
@@ -124,160 +82,202 @@ def compute_ciou_loss(pred_bboxes, target_bboxes, eps=1e-7):
         alpha = v / (1.0 - iou + v + eps)
 
     ciou = iou - (rho2 / c2 + alpha * v)
-    ciou_loss = (1.0 - ciou).squeeze(1)  # [B, 5040]
-    return ciou_loss
+    return 1.0 - ciou
+
+
+def assign_targets_with_tal(
+    pred_scores,
+    pred_bboxes,
+    target_bboxes,
+    gt_mask,
+    anchor_points,
+    alpha=0.5,
+    beta=2.0,
+    is_o2o=False,
+):
+    """각 anchor를 유효 GT 하나에 할당한다. 미할당 anchor는 -1."""
+    batch_size, num_anchors, _ = pred_scores.shape
+    max_objs = target_bboxes.size(1)
+    assigned_gt = torch.full(
+        (batch_size, num_anchors), -1, dtype=torch.long, device=pred_scores.device
+    )
+    assigned_iou = pred_scores.new_zeros((batch_size, num_anchors))
+    if max_objs == 0:
+        return assigned_gt, assigned_iou
+
+    anchors = anchor_points.expand(batch_size, -1, -1)
+    ax, ay = anchors[..., 0:1], anchors[..., 1:2]
+    gx1 = target_bboxes[:, None, :, 0]
+    gy1 = target_bboxes[:, None, :, 1]
+    gx2 = target_bboxes[:, None, :, 2]
+    gy2 = target_bboxes[:, None, :, 3]
+    valid_gt = gt_mask[:, None, :]
+
+    # 앵커 중심점이 GT 박스 내부에 있는지 확인
+    in_gt = (ax >= gx1) & (ax <= gx2) & (ay >= gy1) & (ay <= gy2) & valid_gt
+
+    px1, py1, px2, py2 = pred_bboxes.unbind(-1)
+    inter_x1 = torch.maximum(px1.unsqueeze(-1), gx1)
+    inter_y1 = torch.maximum(py1.unsqueeze(-1), gy1)
+    inter_x2 = torch.minimum(px2.unsqueeze(-1), gx2)
+    inter_y2 = torch.minimum(py2.unsqueeze(-1), gy2)
+    inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
+    gt_area = (gx2 - gx1).clamp(min=0) * (gy2 - gy1).clamp(min=0)
+    overlaps = inter_area / (pred_area.unsqueeze(-1) + gt_area - inter_area + 1e-7)
+    overlaps = overlaps.clamp(min=0.0, max=1.0)
+
+    # TAL 얼라인먼트 스코어 계산 (Classification^alpha * IoU^beta)
+    confidence = pred_scores.detach().sigmoid().amax(dim=-1, keepdim=True)
+    alignment = confidence.pow(alpha) * overlaps.pow(beta)
+    alignment = alignment.masked_fill(~in_gt, -1.0)
+
+    # 1단계: O2M 방식으로 상위 10개(Top-K) 후보군 선별 (공통 과정)
+    topk = min(10, num_anchors)
+    topk_values, topk_indices = alignment.topk(topk, dim=1)
+    candidates = torch.zeros_like(alignment, dtype=torch.bool)
+    candidates.scatter_(1, topk_indices, topk_values >= 0)
+    candidates &= in_gt
+
+    if is_o2o:
+        # ⭐ [Consistent Matching] O2M 후보군(candidates) 내에서만 이분 매칭 수행
+        candidate_alignment = alignment.masked_fill(~candidates, -1.0)
+
+        # Batch 루프를 돌며 각 객체당 후보군 중 최고의 앵커 딱 1개씩 선정
+        for b in range(batch_size):
+            gt_indices = gt_mask[b].nonzero(as_tuple=True)[0]
+            if gt_indices.numel() == 0:
+                continue
+
+            used_anchors = torch.zeros(
+                num_anchors, dtype=torch.bool, device=pred_scores.device
+            )
+
+            # 각 GT 객체별로 후보군 중 가장 얼라인먼트 점수가 높은 앵커 선정
+            for gt_idx in gt_indices:
+                gt_val = candidate_alignment[b, :, gt_idx].clone()
+                gt_val[used_anchors] = -1.0  # 이미 다른 GT가 선점한 앵커는 제외
+
+                anchor_idx = gt_val.argmax()
+                if gt_val[anchor_idx] >= 0:
+                    assigned_gt[b, anchor_idx] = gt_idx
+                    assigned_iou[b, anchor_idx] = overlaps[b, anchor_idx, gt_idx]
+                    used_anchors[anchor_idx] = True
+    else:
+        # 기존 전통적인 O2M 다중 할당 방식
+        candidate_alignment = alignment.masked_fill(~candidates, -1.0)
+        best_alignment, best_gt = candidate_alignment.max(dim=2)
+        positive = best_alignment >= 0
+        batch_indices, anchor_indices = positive.nonzero(as_tuple=True)
+        assigned_gt[batch_indices, anchor_indices] = best_gt[
+            batch_indices, anchor_indices
+        ]
+
+        matched_iou = overlaps.gather(2, best_gt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        assigned_iou[batch_indices, anchor_indices] = matched_iou[
+            batch_indices, anchor_indices
+        ]
+
+    return assigned_gt, assigned_iou
 
 
 def compute_cls_loss_with_tal(
     pred_scores,
     pred_bboxes,
     target_bboxes,
+    gt_mask,
     anchor_points,
     alpha=0.5,
     beta=2.0,
     is_o2o=False,
 ):
-    """
-    개선된 TAL(Task Aligned Assigner) 기반 분류 손실 계산
-    - pred_scores:   [B, 5040, 1] (logits)
-    - pred_bboxes:   [B, 5040, 4] (pixels)
-    - target_bboxes: [B, 1, 4] (pixels)
-    - anchor_points: [1, 5040, 2] (pixels)
-    """
-    batch_size, num_anchors, num_classes = pred_scores.shape
-
-    # 1. In-Box 필터링
-    anc_x, anc_y = anchor_points[..., 0], anchor_points[..., 1]
-    gt_x1, gt_y1 = target_bboxes[..., 0], target_bboxes[..., 1]
-    gt_x2, gt_y2 = target_bboxes[..., 2], target_bboxes[..., 3]
-
-    is_in_box = (
-        (anc_x >= gt_x1) & (anc_x <= gt_x2) & (anc_y >= gt_y1) & (anc_y <= gt_y2)
+    assigned_gt, assigned_iou = assign_targets_with_tal(
+        pred_scores,
+        pred_bboxes,
+        target_bboxes,
+        gt_mask,
+        anchor_points,
+        alpha=alpha,
+        beta=beta,
+        is_o2o=is_o2o,
+    )
+    mask_pos = assigned_gt >= 0
+    target_scores = torch.zeros_like(pred_scores)
+    target_scores[..., 0] = torch.where(
+        mask_pos, assigned_iou.clamp(min=0.3, max=1.0), 0.0
     )
 
-    # 2. IoU 계산 [B, 5040]
-    b1_x1, b1_y1, b1_x2, b1_y2 = pred_bboxes.unbind(-1)
-    inter_x1 = torch.max(b1_x1, gt_x1)
-    inter_y1 = torch.max(b1_y1, gt_y1)
-    inter_x2 = torch.min(b1_x2, gt_x2)
-    inter_y2 = torch.min(b1_y2, gt_y2)
-
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
-
-    w1 = (b1_x2 - b1_x1).clamp(min=0)
-    h1 = (b1_y2 - b1_y1).clamp(min=0)
-    w2 = (gt_x2 - gt_x1).clamp(min=0)
-    h2 = (gt_y2 - gt_y1).clamp(min=0)
-    union_area = (w1 * h1) + (w2 * h2) - inter_area + 1e-7
-    overlaps = (inter_area / union_area).clamp(min=0.0, max=1.0)
-
-    # 3. Alignment Metric: (Classification Confidence ^ alpha) * (IoU ^ beta)
-    pred_probs = pred_scores.detach().sigmoid().max(dim=-1)[0]
-    alignment_metrics = (pred_probs**alpha) * (overlaps**beta)
-
-    metrics_masked = alignment_metrics.clone()
-    metrics_masked[~is_in_box] = -1e9
-
-    # 4. 양성(Positive) 앵커 선택
-    mask_pos = torch.zeros_like(is_in_box, dtype=torch.bool)
-    if is_o2o:
-        max_indices = metrics_masked.argmax(dim=-1, keepdim=True)
-        mask_pos.scatter_(1, max_indices, True)
-        mask_pos = mask_pos & is_in_box
-    else:
-        topk = min(10, num_anchors)
-        _, topk_indices = torch.topk(metrics_masked, topk, dim=-1, largest=True)
-        mask_pos.scatter_(1, topk_indices, True)
-        mask_pos = mask_pos & is_in_box
-
-    # 5. Soft Target 점수 부여 (초기 학습 시에도 양성 앵커가 0으로 죽지 않도록 최소 0.3 보장)
-    target_scores = torch.zeros_like(pred_scores, dtype=torch.float)
-    if mask_pos.any():
-        pos_scores = overlaps[mask_pos].clamp(min=0.3, max=1.0)
-        target_scores[mask_pos, 0] = pos_scores
-
-    # 6. BCE Loss (Positive 정규화)
     bce = F.binary_cross_entropy_with_logits(
         pred_scores, target_scores, reduction="none"
-    )
-    pos_loss = (
-        bce[mask_pos].sum()
-        if mask_pos.any()
-        else torch.tensor(0.0, device=pred_scores.device)
-    )
-    neg_loss = bce[~mask_pos].sum()
-    num_pos = max(mask_pos.sum().item(), 1.0)
+    ).squeeze(-1)
+    pos_count = mask_pos.sum(dim=1)
+    neg_mask = ~mask_pos
+    pos_loss = (bce * mask_pos).sum(dim=1) / pos_count.clamp(min=1)
+    neg_loss = (bce * neg_mask).sum(dim=1) / neg_mask.sum(dim=1).clamp(min=1)
+    if is_o2o:
+        # O2O 헤드는 중복 박스(배경 점수)를 강하게 억제해야 하므로 1.0 온전히 사용
+        neg_weight = torch.ones_like(pos_count, dtype=bce.dtype)
+    else:
+        # O2M 헤드는 기존대로 배경 손실을 낮춤
+        neg_weight = torch.where(
+            pos_count > 0, torch.full_like(pos_count, 0.01, dtype=bce.dtype), 1.0
+        )
+    return (pos_loss + neg_weight * neg_loss).mean(), assigned_gt
 
-    cls_loss = (pos_loss / num_pos) + (
-        0.01 * (neg_loss / max((~mask_pos).sum().item(), 1.0))
-    )
-    return cls_loss, mask_pos
+
+def compute_bbox_loss(pred_bboxes, target_bboxes, assigned_gt):
+    mask_pos = assigned_gt >= 0
+    if not mask_pos.any():
+        return pred_bboxes.sum() * 0.0
+
+    batch_indices = torch.arange(
+        pred_bboxes.size(0), device=pred_bboxes.device
+    ).unsqueeze(1)
+    matched_targets = target_bboxes[batch_indices, assigned_gt.clamp(min=0)]
+    ciou = compute_ciou_loss(pred_bboxes, matched_targets)
+    return (ciou * mask_pos).sum() / mask_pos.sum().clamp(min=1)
 
 
-def compute_kpt_loss(pred_kpts, target_kpts, target_vis, target_bboxes, mask_pos):
+def compute_kpt_loss(pred_kpts, decoded_kpts, target_kpts, target_vis, assigned_gt):
     """
-    양성 앵커에 대한 Keypoint Offset Smooth L1 및 Visibility BCE Loss 계산
+    할당된 정답 객체의 Keypoint Smooth L1 및 Visibility BCE Loss 계산
     - pred_kpts:     [B, 5040, 6] -> (dx, dy, vis_logit) x 2
-    - target_kpts:   [B, 1, 2, 2] (pixels)
-    - target_vis:    [B, 1, 2]    (0: invisible, 1 or 2: visible)
-    - target_bboxes: [B, 1, 4]    (pixels: x1, y1, x2, y2)
-    - mask_pos:      [B, 5040] (bool)
+    - decoded_kpts:  [B, 5040, 2, 2] (pixels: x, y)
+    - target_kpts:   [B, max_objs, 2, 2] (pixels)
+    - target_vis:    [B, max_objs, 2]
+    - assigned_gt:   [B, 5040] (-1: negative, otherwise GT index)
     """
     B = pred_kpts.size(0)
-    kpt_reshaped = pred_kpts.view(B, 5040, 2, 3)
-    pred_xy = kpt_reshaped[..., :2]  # [B, 5040, 2, 2]
-    pred_vis_logits = kpt_reshaped[..., 2]  # [B, 5040, 2]
+    kpt_reshaped = pred_kpts.view(B, pred_kpts.size(1), 2, 3)
+    mask_pos = assigned_gt >= 0
+    if not mask_pos.any():
+        zero = pred_kpts.sum() * 0.0
+        return zero, zero
 
-    # 정답 상대 오프셋 계산 (GT BBox 중심 및 크기 기준 정규화)
-    gt_xc = (target_bboxes[..., 0] + target_bboxes[..., 2]) * 0.5  # [B, 1]
-    gt_yc = (target_bboxes[..., 1] + target_bboxes[..., 3]) * 0.5  # [B, 1]
-    gt_w = (target_bboxes[..., 2] - target_bboxes[..., 0]).clamp(min=1.0)
-    gt_h = (target_bboxes[..., 3] - target_bboxes[..., 1]).clamp(min=1.0)
+    batch_indices = torch.arange(B, device=pred_kpts.device).unsqueeze(1)
+    matched_kpts = target_kpts[batch_indices, assigned_gt.clamp(min=0)]
+    matched_vis = target_vis[batch_indices, assigned_gt.clamp(min=0)]
+    visible = (matched_vis > 0).to(decoded_kpts.dtype)
 
-    target_dx = (target_kpts[..., 0] - gt_xc.unsqueeze(-1)) / gt_w.unsqueeze(-1)
-    target_dy = (target_kpts[..., 1] - gt_yc.unsqueeze(-1)) / gt_h.unsqueeze(-1)
-    target_offsets = torch.stack([target_dx, target_dy], dim=-1)  # [B, 1, 2, 2]
-
-    vis_mask = (target_vis > 0).float()  # [B, 1, 2]
-
-    total_kpt_loss = torch.tensor(0.0, device=pred_kpts.device)
-    total_vis_loss = torch.tensor(0.0, device=pred_kpts.device)
-    pos_count = 0
-
-    for b in range(B):
-        pos_idx = mask_pos[b].nonzero(as_tuple=True)[0]
-        if len(pos_idx) == 0:
-            continue
-
-        b_pred_xy = pred_xy[b, pos_idx]  # [num_pos, 2, 2]
-        b_target_offset = target_offsets[b]  # [1, 2, 2]
-        b_vis_mask = vis_mask[b]  # [1, 2]
-
-        # Smooth L1 거리 손실
-        l1 = F.smooth_l1_loss(
-            b_pred_xy, b_target_offset.expand_as(b_pred_xy), reduction="none"
-        )
-        l1 = l1.sum(dim=-1)  # [num_pos, 2]
-
-        valid_pts = b_vis_mask.sum().clamp(min=1.0)
-        l1_masked = (l1 * b_vis_mask).sum() / (len(pos_idx) * valid_pts)
-        total_kpt_loss = total_kpt_loss + l1_masked
-
-        # Visibility 손실
-        b_pred_vis = pred_vis_logits[b, pos_idx]
-        vis_target = (target_vis[b] > 0).float().expand_as(b_pred_vis)
-        vis_loss = F.binary_cross_entropy_with_logits(b_pred_vis, vis_target)
-        total_vis_loss = total_vis_loss + vis_loss
-
-        pos_count += 1
-
-    if pos_count > 0:
-        return total_kpt_loss / pos_count, total_vis_loss / pos_count
-    return torch.tensor(0.0, device=pred_kpts.device), torch.tensor(
-        0.0, device=pred_kpts.device
+    coord_loss = (
+        F.smooth_l1_loss(decoded_kpts, matched_kpts, reduction="none").sum(dim=-1)
+        / 640.0
     )
+    coord_loss = coord_loss * visible * mask_pos.unsqueeze(-1)
+    kpt_loss = coord_loss.sum() / (
+        (visible * mask_pos.unsqueeze(-1)).sum().clamp(min=1)
+    )
+
+    visibility_loss = F.binary_cross_entropy_with_logits(
+        kpt_reshaped[..., 2],
+        (matched_vis > 0).to(decoded_kpts.dtype),
+        reduction="none",
+    )
+    visibility_loss = visibility_loss * mask_pos.unsqueeze(-1)
+    vis_loss = visibility_loss.sum() / (
+        mask_pos.sum().clamp(min=1) * target_vis.size(-1)
+    )
+    return kpt_loss, vis_loss
 
 
 def compute_ap(recalls, precisions):
@@ -294,83 +294,100 @@ def compute_ap(recalls, precisions):
 def evaluate_metrics(
     model,
     dataloader,
-    anchor_points,
-    anchor_strides,
+    decoder,
     device,
     iou_thresh=0.5,
     kpt_dist_thresh=0.10,
+    conf_thresh=0.25,  # 신뢰도 임계값 상향
+    max_detections=100,
 ):
-    """
-    검증 데이터셋에 대한 BBox mAP@50 및 Keypoint 정확도(PCK@0.10) 평가
-    - model.eval() 상태에서는 one2one_head (cls, regs, kpts) 3개 출력을 직접 반환합니다.
-    """
+    """검증 데이터셋에 대한 BBox mAP@50 및 Keypoint 정확도(PCK@0.10) 평가"""
     model.eval()
 
-    eval_preds = []  # (confidence_score, is_tp_bool)
+    eval_preds = []
     total_gt_boxes = 0
 
     total_gt_kpts = 0
+    evaluated_gt_kpts = 0
     correct_kpts = 0
+    total_kpt_dist_px = 0.0
 
     for batch in dataloader:
-        images = batch[0].to(device, non_blocking=True)
-        target_bboxes = batch[2].to(device, non_blocking=True).clone()
-        target_kpts = batch[3].to(device, non_blocking=True).clone()
-        target_vis = batch[4].to(device, non_blocking=True).clone()
+        images, targets = batch
+        images = images.to(device, non_blocking=True)
+        target_bboxes = targets["gt_bboxes"].to(device, non_blocking=True).clone()
+        target_kpts = targets["gt_keypoints"].to(device, non_blocking=True).clone()
+        target_vis = targets["gt_vis"].to(device, non_blocking=True).clone()
+        gt_mask = targets["gt_mask"].to(device, non_blocking=True)
+        if gt_mask.ndim == 3 and gt_mask.size(-1) == 1:
+            gt_mask = gt_mask.squeeze(-1)
 
-        # 픽셀 복원 (384x640 공간)
+        # 정답 픽셀 복원
         target_bboxes[..., [0, 2]] *= 640.0
         target_bboxes[..., [1, 3]] *= 384.0
         target_kpts[..., 0] *= 640.0
         target_kpts[..., 1] *= 384.0
 
-        # eval 모드에서는 one2one_head의 (cls, regs, kpts)가 반환됨
-        o2o_out = model(images)
-        if isinstance(o2o_out, tuple) and len(o2o_out) == 2:
-            o2o_cls, o2o_regs, o2o_kpts = o2o_out[1]
-        else:
-            o2o_cls, o2o_regs, o2o_kpts = o2o_out
+        # 듀얼 헤드 아웃풋에서 명확하게 O2O(1번째 인덱스)만 언패킹
+        o2o_cls, o2o_regs, o2o_kpts = model(images)
 
-        decoded_bboxes = decode_regs(o2o_regs, anchor_points, anchor_strides)
-        decoded_kpts, _ = decode_keypoints(o2o_kpts, decoded_bboxes)
-        scores = torch.sigmoid(o2o_cls).squeeze(-1)  # [B, 5040]
+        decoded_bboxes = decoder.decode_regs(o2o_regs)
+        decoded_kpts, _ = decoder.decode_keypoints(o2o_kpts)
+        scores = torch.sigmoid(o2o_cls).squeeze(-1)  # [B, Num_Anchors]
 
         B = images.size(0)
         for b in range(B):
-            gt_box = target_bboxes[b, 0]  # [4]
-            gt_kpt = target_kpts[b, 0]  # [2, 2]
-            gt_vis = target_vis[b, 0]  # [2]
+            # GPU 메모리 누수 방지 및 정확한 인덱싱을 위해 .cpu().numpy() 사용
+            gt_indices = gt_mask[b].nonzero(as_tuple=True)[0].cpu().numpy()
+            gt_boxes = target_bboxes[b, gt_indices]
+            gt_kpts = target_kpts[b, gt_indices]
+            gt_vis = target_vis[b, gt_indices]
+            total_gt_boxes += len(gt_indices)
+            total_gt_kpts += (gt_vis > 0).sum().item()
 
-            total_gt_boxes += 1
+            candidate_indices = (scores[b] >= conf_thresh).nonzero(as_tuple=True)[0]
+            if candidate_indices.numel() > max_detections:
+                top_order = scores[b, candidate_indices].topk(max_detections).indices
+                candidate_indices = candidate_indices[top_order]
+            keep_indices = candidate_indices.cpu().numpy()
 
-            # NMS-Free: O2O 헤드에서 가장 높은 점수의 앵커 선택
-            top_idx = scores[b].argmax()
-            top_score = scores[b, top_idx].item()
-            pred_box = decoded_bboxes[b, top_idx]  # [4]
-            pred_kpt = decoded_kpts[b, top_idx]  # [2, 2]
+            matched_gt = torch.zeros(len(gt_indices), dtype=torch.bool, device=device)
+            for pred_idx in keep_indices:
+                pred_score = scores[b, pred_idx].item()
+                if len(gt_indices) == 0:
+                    eval_preds.append((pred_score, False))
+                    continue
 
-            # 1. BBox IoU 계산
-            iou = box_iou(pred_box.unsqueeze(0), gt_box.unsqueeze(0)).item()
-            is_tp = iou >= iou_thresh
-            eval_preds.append((top_score, is_tp))
+                ious = box_iou(
+                    decoded_bboxes[b, pred_idx].unsqueeze(0), gt_boxes
+                ).squeeze(0)
+                ious = ious.masked_fill(matched_gt, -1.0)
+                best_iou, local_gt_idx = ious.max(dim=0)
+                is_tp = best_iou.item() >= iou_thresh
+                eval_preds.append((pred_score, is_tp))
+                if not is_tp:
+                    continue
 
-            # 2. Keypoint 거리 오차 계산 (참외 크기 S = max(w, h) 대비 정규화)
-            gt_w = (gt_box[2] - gt_box[0]).clamp(min=1.0).item()
-            gt_h = (gt_box[3] - gt_box[1]).clamp(min=1.0).item()
-            box_scale = max(gt_w, gt_h)
+                matched_gt[local_gt_idx] = True
+                gt_box = gt_boxes[local_gt_idx]
+                gt_kpt = gt_kpts[local_gt_idx]
+                gt_kpt_vis = gt_vis[local_gt_idx]
+                pred_kpt = decoded_kpts[b, pred_idx]
 
-            for k in range(2):
-                if gt_vis[k] > 0:
-                    total_gt_kpts += 1
-                    dx = pred_kpt[k, 0].item() - gt_kpt[k, 0].item()
-                    dy = pred_kpt[k, 1].item() - gt_kpt[k, 1].item()
-                    dist = np.sqrt(dx**2 + dy**2)
-                    norm_dist = dist / box_scale
+                gt_w = (gt_box[2] - gt_box[0]).clamp(min=1.0).item()
+                gt_h = (gt_box[3] - gt_box[1]).clamp(min=1.0).item()
+                box_scale = max(gt_w, gt_h)
+                for k in range(2):
+                    if gt_kpt_vis[k] > 0:
+                        evaluated_gt_kpts += 1
+                        dx = pred_kpt[k, 0].item() - gt_kpt[k, 0].item()
+                        dy = pred_kpt[k, 1].item() - gt_kpt[k, 1].item()
+                        dist = np.sqrt(dx**2 + dy**2)
+                        total_kpt_dist_px += dist
+                        if dist / box_scale <= kpt_dist_thresh:
+                            correct_kpts += 1
 
-                    if norm_dist <= kpt_dist_thresh:
-                        correct_kpts += 1
-
-    # BBox mAP@50 계산
+    # 지표 계산 단계
     eval_preds.sort(key=lambda x: x[0], reverse=True)
     tps = np.array([1 if x[1] else 0 for x in eval_preds])
     fps = 1 - tps
@@ -381,15 +398,16 @@ def evaluate_metrics(
     precisions = cum_tps / np.maximum(cum_tps + cum_fps, 1e-6)
     bbox_map50 = compute_ap(recalls, precisions) * 100.0
 
-    # Keypoint Accuracy (PCK@0.10) 계산
     kpt_accuracy = (correct_kpts / max(total_gt_kpts, 1)) * 100.0
+    kpt_mae_px = total_kpt_dist_px / max(evaluated_gt_kpts, 1)
 
-    # 종합 평가지표 (BBox 50% + Keypoint 50%)
     fitness = (bbox_map50 * 0.5) + (kpt_accuracy * 0.5)
 
+    # ⭐ [핵심 수정] 모든 batch 루프가 끝나고 결과 딕셔너리를 확실하게 리턴하도록 들여쓰기 정렬
     return {
         "bbox_map50": bbox_map50,
         "kpt_acc": kpt_accuracy,
+        "kpt_mae_px": kpt_mae_px,
         "fitness": fitness,
         "total_gt_boxes": total_gt_boxes,
         "total_gt_kpts": total_gt_kpts,
@@ -399,8 +417,7 @@ def evaluate_metrics(
 def save_validation_visualization(
     model,
     val_dataset,
-    anchor_points,
-    anchor_strides,
+    decoder,
     device,
     epoch,
     fitness,
@@ -409,16 +426,11 @@ def save_validation_visualization(
     num_samples=6,
     save_dir=Path("./runs/visualizations"),
 ):
-    """
-    성능 개선 시 검증 데이터셋 추론 결과를 고품질 이미지 그리드로 시각화하여 저장
-    - Ground Truth: 초록색 BBox 및 키포인트
-    - Prediction:   주황색 BBox 및 키포인트 (Knot: 빨강, Body: 파랑)
-    """
+    """성능 개선 시 검증 데이터셋 추론 결과를 이미지 그리드로 시각화하여 저장"""
     save_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 
     vis_images = []
-    # 항상 동일한 고정 샘플을 시각화하여 에폭별 성능 개선 추이를 직관적으로 비교
     for idx in range(min(num_samples, len(val_dataset))):
         img_t, _, bbox_t, kpt_t, vis_t = val_dataset[idx]
 
@@ -431,58 +443,70 @@ def save_validation_visualization(
 
         input_t = img_t.unsqueeze(0).to(device)
         with torch.no_grad():
-            out = model(input_t)
-            if isinstance(out, tuple) and len(out) == 2:
-                cls_p, reg_p, kpt_p = out[1]
-            else:
-                cls_p, reg_p, kpt_p = out
+            # 듀얼 헤드 아웃풋에서 명확하게 O2O 결과만 추출
+            outputs = model(input_t)
+            cls_p, reg_p, kpt_p = model(input_t)
 
-            dec_box = decode_regs(reg_p, anchor_points, anchor_strides)
-            dec_kpt, _ = decode_keypoints(kpt_p, dec_box)
+            dec_box = decoder.decode_regs(reg_p)
+            dec_kpt, _ = decoder.decode_keypoints(kpt_p)
             scores = torch.sigmoid(cls_p).squeeze(-1)[0]
-            top_idx = scores.argmax().item()
 
-            score = scores[top_idx].item()
-            p_box = dec_box[0, top_idx].cpu().numpy()
-            p_kpt = dec_kpt[0, top_idx].cpu().numpy()
+            # 신뢰도 커트라인을 넘긴 인덱스를 cpu numpy로 안전하게 변환
+            keep_indices = (scores >= 0.25).nonzero(as_tuple=True)
+            if keep_indices[0].numel() > 100:
+                top_order = scores[keep_indices].topk(100).indices
+                keep_indices = keep_indices[0][top_order]
+            keep_indices = (
+                keep_indices[0].cpu().numpy()
+                if isinstance(keep_indices, tuple)
+                else keep_indices.cpu().numpy()
+            )
 
         img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8).copy()
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
         # 1. Ground Truth (초록색)
-        gx1, gy1, gx2, gy2 = map(int, gt_box[0])
-        cv2.rectangle(img_bgr, (gx1, gy1), (gx2, gy2), (0, 255, 0), 2)
-        gk0 = (int(gt_kpt[0, 0, 0]), int(gt_kpt[0, 0, 1]))
-        gk1 = (int(gt_kpt[0, 1, 0]), int(gt_kpt[0, 1, 1]))
-        if vis_t[0, 0] > 0 and vis_t[0, 1] > 0:
-            cv2.line(img_bgr, gk0, gk1, (0, 255, 0), 1, cv2.LINE_AA)
-        if vis_t[0, 0] > 0:
-            cv2.circle(img_bgr, gk0, 4, (0, 255, 128), -1)
-        if vis_t[0, 1] > 0:
-            cv2.circle(img_bgr, gk1, 4, (0, 255, 255), -1)
+        for obj_idx in range(len(gt_box)):
+            gx1, gy1, gx2, gy2 = map(int, gt_box[obj_idx])
+            cv2.rectangle(img_bgr, (gx1, gy1), (gx2, gy2), (0, 255, 0), 2)
+            gk0 = (int(gt_kpt[obj_idx, 0, 0]), int(gt_kpt[obj_idx, 0, 1]))
+            gk1 = (int(gt_kpt[obj_idx, 1, 0]), int(gt_kpt[obj_idx, 1, 1]))
+            if vis_t[obj_idx, 0] > 0 and vis_t[obj_idx, 1] > 0:
+                cv2.line(img_bgr, gk0, gk1, (0, 255, 0), 1, cv2.LINE_AA)
+            if vis_t[obj_idx, 0] > 0:
+                cv2.circle(img_bgr, gk0, 4, (0, 255, 128), -1)
+            if vis_t[obj_idx, 1] > 0:
+                cv2.circle(img_bgr, gk1, 4, (0, 255, 255), -1)
 
         # 2. Prediction (주황/빨간색)
-        px1, py1, px2, py2 = map(int, p_box)
-        cv2.rectangle(img_bgr, (px1, py1), (px2, py2), (0, 140, 255), 2)
-        cv2.putText(
-            img_bgr,
-            f"Melon {score:.2f}",
-            (px1, max(py1 - 6, 18)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 140, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        pk0 = (int(p_kpt[0, 0]), int(p_kpt[0, 1]))
-        pk1 = (int(p_kpt[1, 0]), int(p_kpt[1, 1]))
-        cv2.line(img_bgr, pk0, pk1, (0, 140, 255), 2, cv2.LINE_AA)
-        cv2.circle(img_bgr, pk0, 5, (0, 0, 255), -1)  # Knot: 빨간색
-        cv2.circle(img_bgr, pk1, 5, (255, 0, 0), -1)  # Body: 파란색
+        for pred_idx in keep_indices:
+            score = scores[pred_idx].item()
+            p_box = dec_box[0, pred_idx].cpu().numpy()
+            p_kpt = dec_kpt[0, pred_idx].cpu().numpy()
+            px1, py1, px2, py2 = map(int, p_box)
+            cv2.rectangle(img_bgr, (px1, py1), (px2, py2), (0, 140, 255), 2)
+            cv2.putText(
+                img_bgr,
+                f"Melon {score:.2f}",
+                (px1, max(py1 - 6, 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 140, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            # ⭐ [버그 수정] 키포인트 인덱스(x, y 차원 고정) 정상화
+            pk0 = (int(p_kpt[0, 0]), int(p_kpt[0, 1]))
+            pk1 = (int(p_kpt[1, 0]), int(p_kpt[1, 1]))
+            cv2.line(img_bgr, pk0, pk1, (0, 140, 255), 2, cv2.LINE_AA)
+            cv2.circle(img_bgr, pk0, 5, (0, 0, 255), -1)
+            cv2.circle(img_bgr, pk1, 5, (255, 0, 0), -1)
 
         vis_images.append(img_bgr)
 
-    # 2행 3열 그리드 생성 (총 6장: 2 x 3)
+    if not vis_images:
+        return None, None
+
     if len(vis_images) >= 6:
         row1 = np.hstack(vis_images[:3])
         row2 = np.hstack(vis_images[3:6])
@@ -494,7 +518,6 @@ def save_validation_visualization(
     else:
         grid = np.hstack(vis_images)
 
-    # 상단 정보 배너 추가 (배경 검은색 바)
     banner_h = 40
     banner = np.zeros((banner_h, grid.shape[1], 3), dtype=np.uint8)
     banner_text = (
@@ -518,6 +541,8 @@ def save_validation_visualization(
 
     cv2.imwrite(str(epoch_save_path), final_img)
     cv2.imwrite(str(latest_save_path), final_img)
+
+    # ⭐ [핵심 수정] 튜플 분해 에러(TypeError)를 막기 위해 경로 2개를 정상 리턴하도록 정렬
     return epoch_save_path, latest_save_path
 
 
@@ -536,8 +561,9 @@ def main():
 
     print(f"🚀 학습 디바이스: {DEVICE}")
 
-    # 1. 앵커 생성 (384x640 해상도)
-    anchor_points, anchor_strides = generate_anchors(device=DEVICE)
+    # 1. 공용 디코더 및 384x640 해상도 anchor 생성
+    decoder = DecodeModule().to(DEVICE)
+    anchor_points = decoder.anchors.unsqueeze(0) * decoder.stride_tensor.unsqueeze(0)
 
     # 2. 데이터 분할 및 Dataset 생성
     data_list = find_melon_data(DATA_DIR)
@@ -555,7 +581,8 @@ def main():
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,
+        collate_fn=chamae_pack_collate_fn,
     )
 
     val_loader = DataLoader(
@@ -565,10 +592,11 @@ def main():
         num_workers=NUM_WORKERS,
         pin_memory=True,
         drop_last=False,
+        collate_fn=chamae_pack_collate_fn,
     )
 
     # 3. 모델 및 옵티마이저 생성
-    model = PoseModel(num_classes=1, reg_max=16, num_kpts=2).to(DEVICE)
+    model = Model(num_classes=1, reg_max=16, num_kpts=2).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=TOTAL_EPOCHS, eta_min=1e-5
@@ -577,46 +605,91 @@ def main():
     start_epoch = 1
     best_fitness = 0.0
 
-    # ------------------------------------------------------------------
-    # 💡 [Resume 기능]: 이전 학습 .pt 파일 존재 시 자동 재개
-    # ------------------------------------------------------------------
     resume_candidate_last = SAVE_DIR / "last_fixed.pt"
     resume_candidate_best = SAVE_DIR / "best_fixed.pt"
 
+    ckpt = None
     ckpt_path = None
-    if resume_candidate_last.exists():
-        ckpt_path = resume_candidate_last
-    elif resume_candidate_best.exists():
-        ckpt_path = resume_candidate_best
+    fallback_checkpoint = None
+    model_state = model.state_dict()
+    for candidate in (resume_candidate_last, resume_candidate_best):
+        if not candidate.exists():
+            continue
+        print(f"\n🔄 [체크포인트 로드] {candidate} 확인 중...")
+        try:
+            candidate_ckpt = torch.load(candidate, map_location="cpu")
+            if not isinstance(candidate_ckpt, dict) or not isinstance(
+                candidate_ckpt.get("model_state_dict"), dict
+            ):
+                raise ValueError("필수 model_state_dict가 없는 체크포인트입니다.")
+            candidate_state = candidate_ckpt["model_state_dict"]
+            if candidate_state.keys() != model_state.keys() or any(
+                candidate_state[key].shape != model_state[key].shape
+                for key in model_state
+            ):
+                raise ValueError("모델 파라미터 구성이 현재 모델과 일치하지 않습니다.")
+        except Exception as e:
+            print(f"⚠️ 체크포인트를 사용할 수 없습니다: {candidate} ({e})")
+            continue
+        versions_match = (
+            candidate_ckpt.get("keypoint_decode_version") == KEYPOINT_DECODE_VERSION
+            and candidate_ckpt.get("training_assignment_version")
+            == TRAINING_ASSIGNMENT_VERSION
+        )
+        if versions_match:
+            ckpt_path = candidate
+            break
+        fitness = candidate_ckpt.get("fitness", candidate_ckpt.get("best_fitness", 0.0))
+        if fallback_checkpoint is None or fitness > fallback_checkpoint[0]:
+            fallback_checkpoint = (fitness, candidate)
+
+    if ckpt_path is None and fallback_checkpoint is not None:
+        ckpt_path = fallback_checkpoint[1]
 
     if ckpt_path is not None:
-        print(
-            f"\n🔄 [체크포인트 로드] {ckpt_path} 발견! 이전 학습 상태를 복원합니다..."
-        )
         ckpt = torch.load(ckpt_path, map_location=DEVICE)
         model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except Exception as e:
-                print(f"⚠️ Optimizer 상태 복원 생략: {e}")
-        if "scheduler_state_dict" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            except Exception as e:
-                print(f"⚠️ Scheduler 상태 복원 생략: {e}")
 
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_fitness = ckpt.get("fitness", ckpt.get("best_fitness", 0.0))
-        print(
-            f"✅ 학습 재개 준비 완료 -> 시작 에폭: {start_epoch}/{TOTAL_EPOCHS} | 현재 최고 Fitness: {best_fitness:.2f}\n"
-        )
+    if ckpt is not None:
+        print(f"✅ [체크포인트 로드 완료] {ckpt_path}")
+        if (
+            ckpt.get("keypoint_decode_version") == KEYPOINT_DECODE_VERSION
+            and ckpt.get("training_assignment_version") == TRAINING_ASSIGNMENT_VERSION
+        ):
+            if "optimizer_state_dict" in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except Exception as e:
+                    print(f"⚠️ Optimizer 상태 복원 생략: {e}")
+            if "scheduler_state_dict" in ckpt:
+                try:
+                    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                except Exception as e:
+                    print(f"⚠️ Scheduler 상태 복원 생략: {e}")
+
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_fitness = ckpt.get("fitness", ckpt.get("best_fitness", 0.0))
+            print(
+                f"✅ 학습 재개 준비 완료 -> 시작 에폭: {start_epoch}/{TOTAL_EPOCHS} | "
+                f"현재 최고 Fitness: {best_fitness:.2f}\n"
+            )
+        else:
+            print(
+                "⚠️ 학습 기준이 다른 체크포인트입니다. "
+                "가중치만 불러오고 optimizer/epoch는 초기화해 새 기준으로 재학습합니다.\n"
+            )
     else:
-        print("\n✨ 이전 체크포인트가 없습니다. Epoch 1부터 새로 학습을 시작합니다.\n")
+        if resume_candidate_last.exists() or resume_candidate_best.exists():
+            print(
+                "⚠️ 사용 가능한 체크포인트가 없습니다. "
+                "모델과 optimizer를 초기화하고 Epoch 1부터 학습합니다.\n"
+            )
+        else:
+            print(
+                "\n✨ 이전 체크포인트가 없습니다. Epoch 1부터 새로 학습을 시작합니다.\n"
+            )
 
-    print(
-        "🏁 [학습 시작] BBox(CIoU) + Keypoint(Smooth L1) 통합 학습 및 자동 시각화 활성화\n"
-    )
+    print("🏁 [학습 시작] BBox(CIoU) + Anchor-based Keypoint(Smooth L1) 학습 활성화\n")
 
     for epoch in range(start_epoch, TOTAL_EPOCHS + 1):
         model.train()
@@ -629,31 +702,34 @@ def main():
         for batch in pbar:
             optimizer.zero_grad()
 
-            input_tensor = batch[0].to(DEVICE, non_blocking=True)
-            target_bboxes = batch[2].to(DEVICE, non_blocking=True).clone()
-            target_kpts = batch[3].to(DEVICE, non_blocking=True).clone()
-            target_vis = batch[4].to(DEVICE, non_blocking=True).clone()
+            input_tensor, targets = batch
+            input_tensor = input_tensor.to(DEVICE, non_blocking=True)
+            target_bboxes = targets["gt_bboxes"].to(DEVICE, non_blocking=True).clone()
+            target_kpts = targets["gt_keypoints"].to(DEVICE, non_blocking=True).clone()
+            target_vis = targets["gt_vis"].to(DEVICE, non_blocking=True).clone()
+            gt_mask = targets["gt_mask"].to(DEVICE, non_blocking=True)
+            if gt_mask.ndim == 3 and gt_mask.size(-1) == 1:
+                gt_mask = gt_mask.squeeze(-1)
 
-            # 정답 박스 및 키포인트 픽셀 복원 (384x640 공간)
+            # 정답 픽셀 좌표 복원
             target_bboxes[..., [0, 2]] *= 640.0
             target_bboxes[..., [1, 3]] *= 384.0
             target_kpts[..., 0] *= 640.0
             target_kpts[..., 1] *= 384.0
 
-            # Forward: model.training일 때 (one2many_head, one2one_head) 반환
             preds_m, preds_o = model(input_tensor)
             o2m_cls, o2m_regs, o2m_kpts = preds_m
             o2o_cls, o2o_regs, o2o_kpts = preds_o
 
-            # DFL 픽셀 디코딩
-            decoded_o2m_regs = decode_regs(o2m_regs, anchor_points, anchor_strides)
-            decoded_o2o_regs = decode_regs(o2o_regs, anchor_points, anchor_strides)
+            decoded_o2m_regs = decoder.decode_regs(o2m_regs)
+            decoded_o2o_regs = decoder.decode_regs(o2o_regs)
 
             # 1. TAL 분류 손실
             loss_o2m_cls, mask_o2m = compute_cls_loss_with_tal(
                 o2m_cls,
                 decoded_o2m_regs,
                 target_bboxes,
+                gt_mask,
                 anchor_points,
                 alpha=0.5,
                 beta=2.0,
@@ -663,6 +739,7 @@ def main():
                 o2o_cls,
                 decoded_o2o_regs,
                 target_bboxes,
+                gt_mask,
                 anchor_points,
                 alpha=0.5,
                 beta=2.0,
@@ -670,36 +747,33 @@ def main():
             )
             total_cls_loss = loss_o2m_cls + loss_o2o_cls
 
+            decoded_o2m_kpts, _ = decoder.decode_keypoints(o2m_kpts)
+            decoded_o2o_kpts, _ = decoder.decode_keypoints(o2o_kpts)
+
             # 2. CIoU 회귀 손실
-            ciou_loss_o2m_raw = compute_ciou_loss(decoded_o2m_regs, target_bboxes)
-            ciou_loss_o2o_raw = compute_ciou_loss(decoded_o2o_regs, target_bboxes)
-
-            num_pos_o2m = mask_o2m.sum()
-            num_pos_o2o = mask_o2o.sum()
-
-            ciou_loss_o2m = (
-                (ciou_loss_o2m_raw * mask_o2m.float()).sum() / (num_pos_o2m + 1e-7)
-                if num_pos_o2m > 0
-                else torch.tensor(0.0, device=DEVICE)
-            )
-            ciou_loss_o2o = (
-                (ciou_loss_o2o_raw * mask_o2o.float()).sum() / (num_pos_o2o + 1e-7)
-                if num_pos_o2o > 0
-                else torch.tensor(0.0, device=DEVICE)
-            )
+            ciou_loss_o2m = compute_bbox_loss(decoded_o2m_regs, target_bboxes, mask_o2m)
+            ciou_loss_o2o = compute_bbox_loss(decoded_o2o_regs, target_bboxes, mask_o2o)
             total_ciou_loss = ciou_loss_o2m + ciou_loss_o2o
 
             # 3. Keypoint 회귀 및 Visibility 손실
             loss_kpt_o2m, loss_vis_o2m = compute_kpt_loss(
-                o2m_kpts, target_kpts, target_vis, target_bboxes, mask_o2m
+                o2m_kpts,
+                decoded_o2m_kpts,
+                target_kpts,
+                target_vis,
+                mask_o2m,
             )
             loss_kpt_o2o, loss_vis_o2o = compute_kpt_loss(
-                o2o_kpts, target_kpts, target_vis, target_bboxes, mask_o2o
+                o2o_kpts,
+                decoded_o2o_kpts,
+                target_kpts,
+                target_vis,
+                mask_o2o,
             )
             total_kpt_loss = loss_kpt_o2m + loss_kpt_o2o
             total_vis_loss = loss_vis_o2m + loss_vis_o2o
 
-            # 4. 종합 Loss (Cls, BBox, Keypoint 균형 가중치)
+            # 4. 종합 Loss
             total_loss = (
                 (total_cls_loss * 1.0)
                 + (total_ciou_loss * 5.0)
@@ -731,12 +805,11 @@ def main():
         avg_train_kpt = epoch_kpt_loss / num_batches
         avg_train_total = epoch_total_loss / num_batches
 
-        # 5. Validation 정밀 Metric 평가 (BBox mAP@50 및 Keypoint 정확도)
+        # 5. Validation 평가
         metrics = evaluate_metrics(
             model=model,
             dataloader=val_loader,
-            anchor_points=anchor_points,
-            anchor_strides=anchor_strides,
+            decoder=decoder,
             device=DEVICE,
             iou_thresh=0.5,
             kpt_dist_thresh=0.10,
@@ -744,16 +817,18 @@ def main():
 
         bbox_map = metrics["bbox_map50"]
         kpt_acc = metrics["kpt_acc"]
+        kpt_mae_px = metrics["kpt_mae_px"]
         curr_fitness = metrics["fitness"]
 
         print(
             f" Epoch [{epoch:03d}] | "
             f"Train [Loss: {avg_train_total:.3f}, Cls: {avg_train_cls:.3f}, Box: {avg_train_bbox:.3f}, Kpt: {avg_train_kpt:.3f}] | "
-            f"Val [BBox mAP@50: {bbox_map:.2f}%, Kpt Acc: {kpt_acc:.2f}%, Fitness: {curr_fitness:.2f}]"
+            f"Val [BBox mAP@50: {bbox_map:.2f}%, Kpt Acc: {kpt_acc:.2f}%, "
+            f"Kpt MAE: {kpt_mae_px:.2f}px, Fitness: {curr_fitness:.2f}]"
         )
 
-        # 6. 매 에폭마다 last_fixed.pt 저장 (안전한 중단 및 재개 보장)
-        torch.save(
+        # 6. 체크포인트 저장
+        save_checkpoint_atomic(
             {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -763,15 +838,17 @@ def main():
                 "kpt_acc": kpt_acc,
                 "fitness": curr_fitness,
                 "best_fitness": best_fitness,
+                "keypoint_decode_version": KEYPOINT_DECODE_VERSION,
+                "training_assignment_version": TRAINING_ASSIGNMENT_VERSION,
             },
             SAVE_DIR / "last_fixed.pt",
         )
 
-        # 7. 성능 개선(Fitness 갱신) 시 Best Model 저장 및 시각화 저장
+        # 7. 성능 개선 시 Best 저장 및 추론 시각화 저장
         if curr_fitness > best_fitness:
             best_fitness = curr_fitness
             save_path = SAVE_DIR / "best_fixed.pt"
-            torch.save(
+            save_checkpoint_atomic(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
@@ -780,6 +857,8 @@ def main():
                     "bbox_map50": bbox_map,
                     "kpt_acc": kpt_acc,
                     "fitness": curr_fitness,
+                    "keypoint_decode_version": KEYPOINT_DECODE_VERSION,
+                    "training_assignment_version": TRAINING_ASSIGNMENT_VERSION,
                 },
                 save_path,
             )
@@ -788,12 +867,10 @@ def main():
                 f"(mAP@50: {bbox_map:.2f}%, Kpt Acc: {kpt_acc:.2f}%, Fitness: {curr_fitness:.2f})"
             )
 
-            # 💡 [요청 사항 반영]: 성능 개선 시 Validation 추론 결과 시각화 이미지 저장
             vis_epoch_file, vis_latest_file = save_validation_visualization(
                 model=model,
                 val_dataset=val_dataset,
-                anchor_points=anchor_points,
-                anchor_strides=anchor_strides,
+                decoder=decoder,
                 device=DEVICE,
                 epoch=epoch,
                 fitness=curr_fitness,

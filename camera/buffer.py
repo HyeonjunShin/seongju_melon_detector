@@ -43,9 +43,8 @@ class CameraShm:
         )
 
         self.header_bytes = self.header_dtype.itemsize
-        self.total_bytes = self.header_bytes + (
-            self.frame_dtype.itemsize * 2
-        )  # Because two slot
+        self.total_bytes = self.header_bytes + (self.frame_dtype.itemsize * 2)
+        # Because two slot
 
         if self.is_owner:
             try:

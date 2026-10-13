@@ -12,10 +12,10 @@ from datasets import (
     find_melon_data,
     split_data,
 )
-from model import PoseModel, CombinedModel
+from model import Model, CombinedModel
 
 # =====================================================================
-# 1. Calibration 데이터셋 준비 (200장)
+# 1. Calibration 데이터셋 준비 (300장)
 # =====================================================================
 data_dir = "./data"
 save_dir = "./runs/quantization"
@@ -36,7 +36,7 @@ calibration_tensors = []
 for images, targets in data_loader:
     # images shape: (1, 3, 384, 640)
     calibration_tensors.append(images)
-    if len(calibration_tensors) >= 200:
+    if len(calibration_tensors) >= 300:
         break
 
 print(
@@ -49,7 +49,7 @@ print(
 device = torch.device("cpu")
 
 # CombinedPoseModel (Decoder 포함)
-base_model = PoseModel(num_classes=1, reg_max=16, num_kpts=2)
+base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
 model = CombinedModel(base_model, reg_max=16, num_kpts=2).to(device)
 
 checkpoint_path = "./runs/train/best_fixed.pt"
@@ -105,4 +105,6 @@ quantized_model = ppp.build()
 
 ov.save_model(quantized_model, f"{save_dir}/model_int8.xml")
 ov.save_model(quantized_model, "./model_int8.xml")
-print("✅ 3단계: 전처리가 내장된 INT8 모델 양자화 완료! (runs/quantization/model_int8.xml 및 ./model_int8.xml)")
+print(
+    "✅ 3단계: 전처리가 내장된 INT8 모델 양자화 완료! (runs/quantization/model_int8.xml 및 ./model_int8.xml)"
+)

@@ -114,11 +114,14 @@ class PoseHead(nn.Module):
         cls_all = torch.cat(cls_outputs, dim=-1).permute(0, 2, 1).contiguous()
         reg_all = torch.cat(reg_outputs, dim=-1).permute(0, 2, 1).contiguous()
         kpt_all = torch.cat(kpt_outputs, dim=-1).permute(0, 2, 1).contiguous()
+        # (Batch, 1,  5040) -> (Batch, 5040, 1)
+        # (Batch, 64, 5040) -> (Batch, 5040, 64)
+        # (Batch, 3,  5040) -> (Batch, 5040, 3)
 
         return cls_all, reg_all, kpt_all
 
 
-class PoseModel(nn.Module):
+class Model(nn.Module):
     def __init__(self, num_classes=1, reg_max=16, num_kpts=2):
         super().__init__()
 
@@ -236,6 +239,32 @@ class DecodeModule(nn.Module):
 
         return torch.cat(anchor_list, dim=0), torch.cat(stride_list, dim=0)
 
+    def decode_regs(self, reg_pred):
+        """Decode DFL box predictions into pixel-space XYXY boxes."""
+        batch_size = reg_pred.size(0)
+        reg_dist = (
+            reg_pred.view(batch_size, -1, 4, self.reg_max).softmax(dim=-1) @ self.proj
+        )
+        dist_pixel = reg_dist * self.stride_tensor
+        anchor_pixel = self.anchors * self.stride_tensor
+
+        x1y1 = anchor_pixel - dist_pixel[..., :2]
+        x2y2 = anchor_pixel + dist_pixel[..., 2:]
+        return torch.cat([x1y1, x2y2], dim=-1)
+
+    def decode_keypoints(self, kpt_pred):
+        """Decode anchor-relative keypoint offsets into pixel-space XY."""
+        batch_size = kpt_pred.size(0)
+        kpt_reshaped = kpt_pred.view(batch_size, -1, self.num_kpts, 3)
+        pred_rel_xy = kpt_reshaped[..., :2]
+        vis_logits = kpt_reshaped[..., 2]
+
+        anchor_pixel = self.anchors * self.stride_tensor
+        anchor_pixel = anchor_pixel.view(1, -1, 1, 2)
+        stride = self.stride_tensor.view(1, -1, 1, 1)
+        decoded_kpts = anchor_pixel + pred_rel_xy * stride
+        return decoded_kpts, vis_logits
+
     def forward(self, reg_pred, kpt_pred):
         """
         reg_pred: [B, 5040, 64]  (BBox DFL Raw Output)
@@ -245,41 +274,8 @@ class DecodeModule(nn.Module):
         - decoded_kpts:   [B, 5040, 2, 2] (픽셀 좌표: x, y)
         - vis_logits:     [B, 5040, 2]    (Visibility Logits)
         """
-        B = reg_pred.size(0)
-
-        # 1. BBox DFL 디코딩 (Distances -> Real Pixel BBox)
-        reg_dist = reg_pred.view(B, -1, 4, self.reg_max).softmax(dim=-1) @ self.proj
-        lt = reg_dist[..., :2] * self.stride_tensor
-        rb = reg_dist[..., 2:] * self.stride_tensor
-
-        anchor_pixel = self.anchors * self.stride_tensor
-        decoded_bboxes = torch.cat([anchor_pixel - lt, anchor_pixel + rb], dim=-1)
-
-        # 2. Keypoint 디코딩 (BBox Center & Dimensions 재활용)
-        kpt_reshaped = kpt_pred.view(B, -1, self.num_kpts, 3)
-        pred_rel_x = kpt_reshaped[..., 0:1]  # [B, 5040, 2, 1]
-        pred_rel_y = kpt_reshaped[..., 1:2]  # [B, 5040, 2, 1]
-        vis_logits = kpt_reshaped[..., 2]  # [B, 5040, 2]
-
-        # BBox 중심점 및 크기 추출
-        bbox_xc = (
-            decoded_bboxes[..., 0:1] + decoded_bboxes[..., 2:3]
-        ) * 0.5  # [B, 5040, 1]
-        bbox_yc = (
-            decoded_bboxes[..., 1:2] + decoded_bboxes[..., 3:4]
-        ) * 0.5  # [B, 5040, 1]
-        bbox_w = (decoded_bboxes[..., 2:3] - decoded_bboxes[..., 0:1]).clamp(
-            min=1.0
-        )  # [B, 5040, 1]
-        bbox_h = (decoded_bboxes[..., 3:4] - decoded_bboxes[..., 1:2]).clamp(
-            min=1.0
-        )  # [B, 5040, 1]
-
-        # Absolute Keypoint XY = BBox Center + (Relative Offset * BBox Width/Height)
-        abs_kpt_x = bbox_xc.unsqueeze(-1) + (pred_rel_x * bbox_w.unsqueeze(-1))
-        abs_kpt_y = bbox_yc.unsqueeze(-1) + (pred_rel_y * bbox_h.unsqueeze(-1))
-        decoded_kpts = torch.cat([abs_kpt_x, abs_kpt_y], dim=-1)  # [B, 5040, 2, 2]
-
+        decoded_bboxes = self.decode_regs(reg_pred)
+        decoded_kpts, vis_logits = self.decode_keypoints(kpt_pred)
         return decoded_bboxes, decoded_kpts, vis_logits
 
 
@@ -317,7 +313,7 @@ class CombinedModel(nn.Module):
 if __name__ == "__main__":
     dummy_input = torch.randn(1, 3, 384, 640)
 
-    base_model = PoseModel(num_classes=1, reg_max=16, num_kpts=2)
+    base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
     export_model = CombinedModel(base_model).eval()
 
     with torch.no_grad():

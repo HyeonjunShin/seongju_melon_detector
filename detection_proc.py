@@ -11,7 +11,7 @@ import torchvision.ops
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from camera.buffer import CameraShm
-from model import PoseModel, CombinedModel
+from model import Model, CombinedModel
 
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"
@@ -25,7 +25,7 @@ MODEL_H = 384
 NET_IMG_H = 360  # Letterbox 유효 영역 높이
 PAD_TOP = 12.0  # 상단 패딩 크기
 
-CONF_THRESH = 0.35  # 러프한 오검출 방지를 위해 0.35로 조정
+CONF_THRESH = 0.9  # 러프한 오검출 방지를 위해 0.35로 조정
 VIS_THRESH = 0.5
 IOU_NMS_THRESH = 0.45
 
@@ -149,7 +149,7 @@ def signal_handler(signum, frame):
 
 def load_model(model_path="./runs/train/best_fixed.pt", device="cuda"):
     print(f"🚀 [Detection Process] AI CombinedModel 로딩 중... ({device})")
-    base_model = PoseModel(num_classes=1, reg_max=16, num_kpts=2)
+    base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
     model = CombinedModel(base_model, reg_max=16, num_kpts=2).to(device)
 
     if os.path.exists(model_path):
@@ -210,7 +210,8 @@ def main():
     start_time = time.time()
     last_sequence_id = 0
 
-    smoother = DetectionSmoother(alpha=0.65)
+    # smoother = DetectionSmoother(alpha=0.85)
+    smoother = DetectionSmoother(alpha=1.0)
 
     try:
         while is_running:

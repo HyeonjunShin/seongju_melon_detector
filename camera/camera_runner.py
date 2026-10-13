@@ -3,8 +3,8 @@ import sys
 import time
 import signal
 import posix_ipc
-from buffer import CameraShm
-from gemini336 import Gemini336
+from .buffer import CameraShm
+from .gemini336 import Gemini336
 
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"
