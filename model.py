@@ -195,10 +195,10 @@ class Model(nn.Module):
 
         final_features = [p3_out, p4_out, p5_out]  # 8, 16, 32 strides
 
-        if self.training:
-            return self.one2many_head(final_features), self.one2one_head(final_features)
-        else:
-            return self.one2one_head(final_features)
+        # if self.training:
+        return self.one2many_head(final_features), self.one2one_head(final_features)
+        # else:
+        # return self.one2one_head(final_features)
 
 
 class DecodeModule(nn.Module):
@@ -295,15 +295,22 @@ class CombinedModel(nn.Module):
         )
 
     def forward(self, x):
-        cls_pred, reg_pred, kpt_pred = self.base_model(x)
+        o2m, o2o = self.base_model(x)
+        cls_logits_o2m, reg_o2m, kp_o2m = o2m
+        cls_logits_o2o, reg_o2o, kp_o2o = o2o
 
-        scores = torch.sigmoid(cls_pred)
+        cls_score_o2m = torch.sigmoid(cls_logits_o2m)
+        cls_score_o2o = torch.sigmoid(cls_logits_o2o)
 
-        decoded_bboxes, decoded_kpts, vis_logits = self.decoder(reg_pred, kpt_pred)
+        bbox_o2m, kp_o2m, vis_logits_o2m = self.decoder(reg_o2m, kp_o2m)
+        bbox_o2o, kp_o2o, vis_logits_o2o = self.decoder(reg_o2o, kp_o2o)
 
-        vis_probs = torch.sigmoid(vis_logits)
+        vis_socre_o2m = torch.sigmoid(vis_logits_o2m)
+        vis_socre_o2o = torch.sigmoid(vis_logits_o2o)
 
-        return scores, decoded_bboxes, decoded_kpts, vis_probs
+        ret_o2m = (cls_score_o2m, bbox_o2m, kp_o2m, vis_socre_o2m)
+        ret_o2o = (cls_score_o2o, bbox_o2o, kp_o2o, vis_socre_o2o)
+        return ret_o2m, ret_o2o
 
 
 # =====================================================================
@@ -314,14 +321,17 @@ if __name__ == "__main__":
     dummy_input = torch.randn(1, 3, 384, 640)
 
     base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
-    export_model = CombinedModel(base_model).eval()
+    combinedModel = CombinedModel(base_model).eval()
 
     with torch.no_grad():
-        scores, bboxes, kps, vis = export_model(dummy_input)
+        ret_o2m, ret_o2o = combinedModel(dummy_input)
+        cls_score_o2m, bbox_o2m, kp_o2m, vis_socre_o2m = ret_o2m
+        cls_score_o2o, bbox_o2o, kp_o2o, vis_socre_o2o = ret_o2o
 
     print("⚡ [검증 완료] Combined Model 출력 확인:")
-    print(" - Scores Shape   :", scores.shape)  # [1, 5040, 1]
-    print(" - BBoxes Shape   :", bboxes.shape)  # [1, 5040, 4]
-    print(" - Keypoints Shape:", kps.shape)
-    print(" - Visibility Shape:", vis.shape)
+    print(" - Scores Shape   :", cls_score_o2m.shape, cls_score_o2o.shape)
+    # [1, 5040, 1]
+    print(" - BBoxes Shape   :", bbox_o2m.shape, bbox_o2o.shape)  # [1, 5040, 4]
+    print(" - Keypoints Shape:", kp_o2m.shape, kp_o2o.shape)
+    print(" - Visibility Shape:", vis_socre_o2m.shape, vis_socre_o2o.shape)
     # [1, 5040, 2, 3] -> (Knot, Body) x (x, y, vis)

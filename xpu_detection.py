@@ -3,9 +3,12 @@ import ctypes
 import numpy as np
 import cv2
 import openvino as ov
+import torch
 from multiprocessing import shared_memory
 from dataclasses import dataclass
 from scipy.spatial.transform import Rotation as R
+
+from model import DecodeModule, Model
 
 
 class BufferHeader(ctypes.Structure):
@@ -24,6 +27,33 @@ class TrackObj:
     bbox: np.ndarray  # [x1, y1, x2, y2]
     centroid: np.ndarray  # [X, Y, Z] (3D m 단위, Body Keypoint 중심)
     rotation: np.ndarray  # [qx, qy, qz, qw] (Body -> Knot 방향 쿼터니언)
+
+
+class DetectionEMA:
+    def __init__(self, alpha=0.3):
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("alpha must be in the range (0, 1]")
+        self.alpha = alpha
+        self.bbox = None
+        self.keypoints = None
+
+    def update(self, score, bbox, keypoints, visibility):
+        if bbox is None or keypoints is None:
+            self.bbox = None
+            self.keypoints = None
+            return score, bbox, keypoints, visibility
+
+        bbox = np.asarray(bbox, dtype=np.float32)
+        keypoints = np.asarray(keypoints, dtype=np.float32)
+        if self.bbox is None:
+            self.bbox = bbox.copy()
+            self.keypoints = keypoints.copy()
+        else:
+            self.bbox = self.alpha * bbox + (1.0 - self.alpha) * self.bbox
+            self.keypoints = (
+                self.alpha * keypoints + (1.0 - self.alpha) * self.keypoints
+            )
+        return score, self.bbox.copy(), self.keypoints.copy(), visibility
 
 
 class DetectorBuffer:
@@ -211,10 +241,15 @@ class Detector:
         self.compiled_model = core.compile_model(ov_model, device_name)
 
         # PrePostProcessor가 전처리를 완료한 포즈 모델의 출력 바인딩
-        self.output_scores = self.compiled_model.output(0)  # [1, 5040, 1]
-        self.output_bboxes = self.compiled_model.output(1)  # [1, 5040, 4]
-        self.output_kpts = self.compiled_model.output(2)  # [1, 5040, 2, 2]
-        self.output_vis = self.compiled_model.output(3)  # [1, 5040, 2, 2]
+        self.output_scores_o2m = self.compiled_model.output(0)  # [1, 5040, 1]
+        self.output_bboxes_o2m = self.compiled_model.output(1)  # [1, 5040, 4]
+        self.output_kpts_o2m = self.compiled_model.output(2)  # [1, 5040, 2, 2]
+        self.output_vis_o2m = self.compiled_model.output(3)  # [1, 5040, 2]
+
+        self.output_scores_o2o = self.compiled_model.output(4)  # [1, 5040, 1]
+        self.output_bboxes_o2o = self.compiled_model.output(5)  # [1, 5040, 4]
+        self.output_kpts_o2o = self.compiled_model.output(6)  # [1, 5040, 2, 2]
+        self.output_vis_o2o = self.compiled_model.output(7)  # [1, 5040, 2]
 
     def detect(self, color_img):
         """color_img: (720, 1280, 3) Raw Camera Frame (u8, NHWC)
@@ -223,24 +258,87 @@ class Detector:
         input_tensor = color_img[None, ...]  # [1, 720, 1280, 3]
         results = self.compiled_model({0: input_tensor})
 
-        scores = results[self.output_scores][0].squeeze(-1)  # [5040]
-        bboxes = results[self.output_bboxes][0]  # [5040, 4]
-        kpts = results[self.output_kpts][0]  # [5040, 2, 2]
-        vis = results[self.output_vis][0]  # [5040, 2, 2]
+        # scores = results[self.output_scores][0].squeeze(-1)  # [5040]
+        # bboxes = results[self.output_bboxes][0]  # [5040, 4]
+        # kpts = results[self.output_kpts][0]  # [5040, 2, 2]
+        # vis = results[self.output_vis][0]  # [5040, 2, 2]
+
+        # scores = results[self.output_scores_o2m][0].squeeze(-1)  # [5040]
+        # bboxes = results[self.output_bboxes_o2m][0]  # [5040, 4]
+        # kpts = results[self.output_kpts_o2m][0]  # [5040, 2, 2]
+        # vis = results[self.output_vis_o2m][0]  # [5040, 2, 2]
+
+        scores = results[self.output_scores_o2o][0].squeeze(-1)  # [5040]
+        bboxes = results[self.output_bboxes_o2o][0]  # [5040, 4]
+        kpts = results[self.output_kpts_o2o][0]  # [5040, 2, 2]
+        vis = results[self.output_vis_o2o][0]  # [5040, 2]
 
         # NMS-Free 방식: 가장 점수가 높은 Top-1 앵커 선택
         best_idx = np.argmax(scores)
         best_score = scores[best_idx]
 
         if best_score < self.conf_threshold:
-            return 0.0, None, None
+            return 0.0, None, None, None
 
         best_bbox = bboxes[best_idx]  # [x1, y1, x2, y2]
-        best_kpt = kpts[
-            best_idx
-        ]  # [[knot_x, knot_y, knot_vis_logit], [body_x, body_y, body_vis_logit]]
+        best_kpt = kpts[best_idx]  # [[body_x, body_y], [knot_x, knot_y]]
+        best_vis = vis[best_idx]  # [body_visibility, knot_visibility]
 
-        return float(best_score), best_bbox, best_kpt, vis
+        return float(best_score), best_bbox, best_kpt, best_vis
+
+
+def prepare_pytorch_input(color_img, device):
+    resized = cv2.resize(color_img, (640, 360), interpolation=cv2.INTER_LINEAR)
+    padded = cv2.copyMakeBorder(
+        resized, 12, 12, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+    )
+    return (
+        torch.from_numpy(padded)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(device=device, dtype=torch.float32)
+        .div_(255.0)
+    )
+
+
+class PyTorchDetector:
+    def __init__(self, checkpoint, device=None, conf_threshold=0.25):
+        if not os.path.exists(checkpoint):
+            raise FileNotFoundError(1, "Not found the checkpoint file.", checkpoint)
+
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.conf_threshold = conf_threshold
+        self.model = Model(num_classes=1, reg_max=16, num_kpts=2).to(self.device)
+        state = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        if "model" in state:
+            state = state["model"]
+        elif "model_state_dict" in state:
+            state = state["model_state_dict"]
+        self.model.load_state_dict(state)
+        self.model.eval()
+        self.decoder = DecodeModule(reg_max=16, num_kpts=2).to(self.device).eval()
+        print(f"📦 PyTorch FP32 모델 로드 완료: {checkpoint} [{self.device}]")
+
+    @torch.inference_mode()
+    def detect(self, color_img):
+        _, one2one = self.model(prepare_pytorch_input(color_img, self.device))
+        cls_logits, reg_pred, kpt_pred = one2one
+        bboxes, keypoints, vis_logits = self.decoder(reg_pred, kpt_pred)
+        scores = cls_logits[0, :, 0].sigmoid()
+        best_idx = int(scores.argmax())
+        best_score = float(scores[best_idx])
+
+        if best_score < self.conf_threshold:
+            return 0.0, None, None, None
+
+        return (
+            best_score,
+            bboxes[0, best_idx].cpu().numpy(),
+            keypoints[0, best_idx].cpu().numpy(),
+            vis_logits[0, best_idx].sigmoid().cpu().numpy(),
+        )
 
 
 def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
@@ -345,14 +443,25 @@ def compute_pose_with_kpts(depth_img, kpts, K, DIST_COEFFS, vis_thresh=0.5):
 
     return centroid, quaternion
 
+
 is_running = True
+
+
 def main():
+    import argparse
     import signal
     import posix_ipc
     from camera.buffer import CameraShm
     from camera.gemini336 import color_shape, depth_shape
     from camera.camera_runner import SHM_NAME, SEM_NAME
-    import torch
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("openvino", "pytorch"), default="openvino")
+    parser.add_argument("--checkpoint", default="runs/dual_v2/best.pt")
+    parser.add_argument("--model", default="model_int8.xml")
+    parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--ema-alpha", type=float, default=0.3)
+    args = parser.parse_args()
 
     global is_running
 
@@ -384,8 +493,14 @@ def main():
         camera_shm.close()
         return
 
-    detector = Detector()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.backend == "pytorch":
+        detector = PyTorchDetector(args.checkpoint, conf_threshold=args.confidence)
+    else:
+        detector = Detector(args.model, conf_threshold=args.confidence)
+    detection_ema = DetectionEMA(args.ema_alpha)
+
+    window_name = f"{args.backend.title()} Melon Detection"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     last_sequence_id = 0
     try:
@@ -406,11 +521,84 @@ def main():
             current_frame = camera_shm.read()
 
             timestamp = current_frame.timestamp
-            color = current_frame.color.copy()
-            depth = current_frame.depth.copy()
+            # CameraShm uses (width, height, channels); inference expects HWC.
+            color = current_frame.color.reshape((720, 1280, 3)).copy()
+            depth = current_frame.depth.reshape((720, 1280)).copy()
 
             score, bbox, kpts, vis = detector.detect(color)
-            print(score)
+            score, bbox, kpts, vis = detection_ema.update(score, bbox, kpts, vis)
+
+            # The model input is 640x384: original camera pixels were halved,
+            # then 12 pixels of vertical padding were added.
+            display = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+            if bbox is not None and kpts is not None and vis is not None:
+                box = np.asarray(bbox, dtype=np.float32).reshape(4)
+                points = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
+                visibility = np.asarray(vis, dtype=np.float32).reshape(-1)
+                if (
+                    np.isfinite(box).all()
+                    and np.isfinite(points).all()
+                    and np.isfinite(visibility).all()
+                    and len(points) >= 2
+                    and len(visibility) >= 2
+                ):
+                    x1, y1, x2, y2 = box
+                    x1 = int(np.clip(x1 * 2.0, 0, 1279))
+                    x2 = int(np.clip(x2 * 2.0, 0, 1279))
+                    y1 = int(np.clip((y1 - 12.0) * 2.0, 0, 719))
+                    y2 = int(np.clip((y2 - 12.0) * 2.0, 0, 719))
+                    if x2 > x1 and y2 > y1:
+                        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 140, 255), 2)
+                        cv2.putText(
+                            display,
+                            f"Melon {score:.2f}",
+                            (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 140, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                        rendered_points = []
+                        for point in points[:2]:
+                            px = int(np.clip(point[0] * 2.0, 0, 1279))
+                            py = int(np.clip((point[1] - 12.0) * 2.0, 0, 719))
+                            rendered_points.append((px, py))
+
+                        if np.all(visibility[:2] >= 0.5):
+                            cv2.line(
+                                display,
+                                rendered_points[0],
+                                rendered_points[1],
+                                (0, 140, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+                        for point, label, color_bgr, probability in zip(
+                            rendered_points,
+                            ("Body", "Knot"),
+                            ((255, 0, 0), (0, 0, 255)),
+                            visibility[:2],
+                        ):
+                            if probability >= 0.5:
+                                cv2.circle(
+                                    display, point, 5, color_bgr, -1, cv2.LINE_AA
+                                )
+                                cv2.putText(
+                                    display,
+                                    f"{label} {probability:.2f}",
+                                    (point[0] + 7, point[1] - 7),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5,
+                                    color_bgr,
+                                    1,
+                                    cv2.LINE_AA,
+                                )
+
+            cv2.imshow(window_name, display)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
 
     except KeyboardInterrupt:
         print("\n[알림] Ctrl + C 입력으로 중단되었습니다.")

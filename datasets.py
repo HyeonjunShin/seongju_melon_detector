@@ -110,7 +110,7 @@ class ChamaePackDataset(Dataset):
                     v2.RandomApply(
                         [v2.GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 2.0))], p=0.5
                     ),
-                    v2.RandomRotation(degrees=(-30, 30)),
+                    v2.RandomApply([v2.RandomRotation(degrees=(-10, 10))], p=0.3),
                     v2.ToDtype(torch.float32, scale=True),
                 ]
             )
@@ -202,10 +202,17 @@ class ChamaePackDataset(Dataset):
         ret_bbox[..., [1, 3]] = ret_bbox[..., [1, 3]] / float(self.target_height)
 
         ret_kps = transformed["keypoints"].to_dense().clone()
+        in_image = (
+            (ret_kps[..., 0] >= 0)
+            & (ret_kps[..., 0] < self.target_width)
+            & (ret_kps[..., 1] >= 0)
+            & (ret_kps[..., 1] < self.target_height)
+        )
+        ret_vis = vis_tensor * in_image.to(vis_tensor.dtype)
         ret_kps[..., 0] = ret_kps[..., 0] / float(self.target_width)
         ret_kps[..., 1] = ret_kps[..., 1] / float(self.target_height)
 
-        return ret_color, cls_tensor, ret_bbox, ret_kps, vis_tensor
+        return ret_color, cls_tensor, ret_bbox, ret_kps, ret_vis
 
 
 if __name__ == "__main__":

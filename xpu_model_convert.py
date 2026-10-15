@@ -52,12 +52,12 @@ device = torch.device("cpu")
 base_model = Model(num_classes=1, reg_max=16, num_kpts=2)
 model = CombinedModel(base_model, reg_max=16, num_kpts=2).to(device)
 
-checkpoint_path = "./runs/train/best_fixed.pt"
+checkpoint_path = "./runs/dual_kpt10/best.pt"
 ckpt = torch.load(checkpoint_path, map_location=device)
 if "model_state_dict" in ckpt:
     model.base_model.load_state_dict(ckpt["model_state_dict"])
 else:
-    model.load_state_dict(ckpt)
+    base_model.load_state_dict(ckpt)
 
 model.eval()
 
