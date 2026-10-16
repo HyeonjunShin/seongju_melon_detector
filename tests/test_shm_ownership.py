@@ -83,6 +83,22 @@ shm.close()
         owner.close()
         self.assert_removed(self.flange_name)
 
+    def test_flange_defaults_to_attach_only(self):
+        owner = FlangeShm(self.flange_name, is_owner=True)
+        self.owners.append(owner)
+
+        self.run_worker(
+            f"""
+from common.shm_flange import FlangeShm
+shm = FlangeShm({self.flange_name!r})
+assert not shm.is_owner
+shm.close()
+"""
+        )
+
+        owner.status = True
+        self.assertTrue(owner.status)
+
     def test_target_owner_unlinks_and_attached_instance_exchanges_data(self):
         owner = TargetShm(self.target_name, is_owner=True)
         self.owners.append(owner)

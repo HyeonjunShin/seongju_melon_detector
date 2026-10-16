@@ -38,7 +38,7 @@ class FlangeShm:
     };                               // Total = 13,616 bytes
     """
 
-    def __init__(self, shm_name: str = "shm_flange", is_owner: bool = True):
+    def __init__(self, shm_name: str = "shm_flange", is_owner: bool = False):
         self.buffer_size = 100
         self._shm_name = shm_name
         self.is_owner = is_owner
@@ -202,7 +202,7 @@ class FlangeShm:
         self.close()
 
 
-def print_terminal_dashboard(shm_name: str = "shm_flange", is_owner: bool = True):
+def print_terminal_dashboard(shm_name: str = "shm_flange", is_owner: bool = False):
     print(f"[Monitor] '{shm_name}' 공유 메모리 할당/연결 시도 중...")
 
     try:
@@ -290,5 +290,4 @@ def print_terminal_dashboard(shm_name: str = "shm_flange", is_owner: bool = True
 
 
 if __name__ == "__main__":
-    # Python에서 메모리를 Create하고 실행
-    print_terminal_dashboard(shm_name="flange_shm", is_owner=True)
+    print_terminal_dashboard()
