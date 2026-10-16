@@ -1,5 +1,7 @@
 import unittest
 from multiprocessing import shared_memory
+import subprocess
+import sys
 from uuid import uuid4
 
 import numpy as np
@@ -25,6 +27,9 @@ class SharedMemoryOwnershipTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             shared_memory.SharedMemory(name=name, create=False)
 
+    def run_worker(self, source):
+        subprocess.run([sys.executable, "-c", source], check=True)
+
     def test_camera_owner_is_exclusive_and_attached_close_preserves_data(self):
         owner = CameraShm(
             self.camera_name,
@@ -36,23 +41,16 @@ class SharedMemoryOwnershipTest(unittest.TestCase):
         self.assertFalse(owner.status)
         self.assertEqual(owner.sequence_id, 0)
 
-        attached = CameraShm(
-            self.camera_name,
-            is_owner=False,
-            color_shape=(1, 2, 3),
-            depth_shape=(1, 2, 1),
+        self.run_worker(
+            f"""
+import numpy as np
+from common.shm_camera import CameraShm
+shm = CameraShm({self.camera_name!r}, is_owner=False, color_shape=(1, 2, 3), depth_shape=(1, 2, 1))
+shm.write(7, np.ones((1, 2, 3), np.uint8), np.full((1, 2, 1), 9, np.uint16))
+shm.close()
+"""
         )
-        owner.write(7, np.ones((1, 2, 3), np.uint8), np.full((1, 2, 1), 9, np.uint16))
-        attached.close()
-
-        reopened = CameraShm(
-            self.camera_name,
-            is_owner=False,
-            color_shape=(1, 2, 3),
-            depth_shape=(1, 2, 1),
-        )
-        self.assertEqual(reopened.read().timestamp, 7)
-        reopened.close()
+        self.assertEqual(owner.read().timestamp, 7)
 
         with self.assertRaises(FileExistsError):
             CameraShm(
@@ -72,10 +70,15 @@ class SharedMemoryOwnershipTest(unittest.TestCase):
         self.assertEqual(owner.sequence, 0)
         self.assertEqual(owner.head, 0)
 
-        attached = FlangeShm(self.flange_name, is_owner=False)
-        attached.status = True
+        self.run_worker(
+            f"""
+from common.shm_flange import FlangeShm
+shm = FlangeShm({self.flange_name!r}, is_owner=False)
+shm.status = True
+shm.close()
+"""
+        )
         self.assertTrue(owner.status)
-        attached.close()
 
         owner.close()
         self.assert_removed(self.flange_name)
@@ -86,9 +89,14 @@ class SharedMemoryOwnershipTest(unittest.TestCase):
         self.assertFalse(owner.status)
         self.assertEqual(owner.index, 0)
 
-        attached = TargetShm(self.target_name, is_owner=False)
-        attached.write(timestamp=11, detected=True, score=0.75)
-        attached.close()
+        self.run_worker(
+            f"""
+from common.shm_target import TargetShm
+shm = TargetShm({self.target_name!r}, is_owner=False)
+shm.write(timestamp=11, detected=True, score=0.75)
+shm.close()
+"""
+        )
         self.assertEqual(owner.read().timestamp, 11)
         self.assertTrue(owner.read().detected)
 
