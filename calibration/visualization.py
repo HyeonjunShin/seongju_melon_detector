@@ -1,5 +1,5 @@
 """
-python visualization.py \ \
+python visualization.py \
   --stl ./gripper1.stl \
   --xyz 0.07141 -0.011 0.05256 \
   --rpy 0 20 0 \

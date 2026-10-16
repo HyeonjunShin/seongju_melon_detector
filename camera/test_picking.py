@@ -56,9 +56,7 @@ def pixel_to_camera_xyz(u, v, depth_img):
     if valid_depths.size == 0:
         return None
 
-    z_m = float(np.median(valid_depths))
-    if z_m > 10.0:
-        z_m /= 1000.0
+    z_m = float(np.median(valid_depths)) / 1000.0
 
     pixel = np.array([[[u, v]]], dtype=np.float32)
     undistorted = cv2.undistortPoints(pixel, K, D, P=K)[0, 0]
