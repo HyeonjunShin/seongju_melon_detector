@@ -63,18 +63,10 @@ class FlangeShm:
         self.shared_memory_size = self.header_bytes + (self.frame_dtype.itemsize * self.buffer_size)
 
         if self.is_owner:
-            try:
-                self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
-                print(f"[Python SHM] 기존 공유 메모리 '{self.shm_name}'에 재연결되었습니다.")
-
-            except FileNotFoundError:
-                self.shm = shared_memory.SharedMemory(
-                    name=self.shm_name, create=True, size=self.shared_memory_size
-                )
-                self.shm.buf[: self.shared_memory_size] = b"\x00" * self.shared_memory_size
-                print(
-                    f"[Python SHM] 공유 메모리 '{self.shm_name}' 신규 생성 완료 ({self.shared_memory_size} bytes)"
-                )
+            self.shm = shared_memory.SharedMemory(
+                name=self.shm_name, create=True, size=self.shared_memory_size
+            )
+            self.shm.buf[: self.shared_memory_size] = b"\x00" * self.shared_memory_size
         else:
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             unregister(self.shm._name, "shared_memory")
@@ -196,6 +188,11 @@ class FlangeShm:
 
         if hasattr(self, "shm") and self.shm is not None:
             self.shm.close()
+            if self.is_owner:
+                try:
+                    self.shm.unlink()
+                except FileNotFoundError:
+                    pass
             self.shm = None
 
     def __enter__(self):

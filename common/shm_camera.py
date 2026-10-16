@@ -47,15 +47,10 @@ class CameraShm:
         # Because two slot
 
         if self.is_owner:
-            try:
-                old_shm = shared_memory.SharedMemory(name=self.shm_name)
-                old_shm.close()
-                old_shm.unlink()
-            except FileNotFoundError:
-                pass
             self.shm = shared_memory.SharedMemory(
                 name=self.shm_name, create=True, size=self.total_bytes
             )
+            self.shm.buf[: self.total_bytes] = b"\x00" * self.total_bytes
         else:
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             unregister(self.shm._name, "shared_memory")

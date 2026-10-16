@@ -71,14 +71,10 @@ class TargetShm:
         self.total_bytes = self.header_bytes + (2 * self.slot_bytes)
 
         if self.is_owner:
-            try:
-                self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
-                print(f"[Python SHM] 기존 공유 메모리 '{self.shm_name}'에 재연결되었습니다.")
-
-            except FileNotFoundError:
-                self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=self.total_bytes)
-                self.shm.buf[: self.total_bytes] = b"\x00" * self.total_bytes
-                print(f"[Python SHM] 공유 메모리 '{self.shm_name}' 신규 생성 완료 ({self.total_bytes} bytes)")
+            self.shm = shared_memory.SharedMemory(
+                name=self.shm_name, create=True, size=self.total_bytes
+            )
+            self.shm.buf[: self.total_bytes] = b"\x00" * self.total_bytes
         else:
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             unregister(self.shm._name, "shared_memory")
