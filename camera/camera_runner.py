@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import signal
 import posix_ipc
@@ -8,6 +7,8 @@ from camera.gemini336 import Gemini336
 
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"
+COLOR_SHAPE = (1280, 720, 3)
+DEPTH_SHAPE = (1280, 720, 1)
 
 is_running = True
 
@@ -17,6 +18,26 @@ def signal_handler(signum, frame):
     global is_running
     print("\n🛑 [Camera Runner] 종료 신호를 수신했습니다. 정리 작업을 진행합니다...")
     is_running = False
+
+
+def open_camera_ipc() -> tuple[CameraShm, posix_ipc.Semaphore]:
+    try:
+        camera_shm = CameraShm(
+            shm_name=SHM_NAME,
+            is_owner=False,
+            color_shape=COLOR_SHAPE,
+            depth_shape=DEPTH_SHAPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("main.py를 먼저 실행하세요") from exc
+
+    try:
+        camera_sem = posix_ipc.Semaphore(SEM_NAME)
+    except posix_ipc.ExistentialError as exc:
+        camera_shm.close()
+        raise RuntimeError("main.py를 먼저 실행하세요") from exc
+
+    return camera_shm, camera_sem
 
 
 def main():
@@ -32,37 +53,20 @@ def main():
         except Exception:
             pass
 
-    # 1. POSIX Named Semaphore 생성 및 초기화 (Owner)
     try:
-        try:
-            old_sem = posix_ipc.Semaphore(SEM_NAME)
-            old_sem.close()
-            old_sem.unlink()
-        except Exception:
-            pass
-
-        sem = posix_ipc.Semaphore(SEM_NAME, flags=posix_ipc.O_CREAT, initial_value=0)
-    except Exception as e:
-        print(f"❌ [Camera Runner] 세마포어 생성 실패: {e}")
-        sys.exit(1)
-
-    # 2. Shared Memory 생성 (is_owner=True)
-    color_shape = (1280, 720, 3)
-    depth_shape = (1280, 720, 1)
-
-    camera_shm = CameraShm(
-        shm_name=SHM_NAME,
-        is_owner=True,
-        color_shape=color_shape,
-        depth_shape=depth_shape,
-    )
+        camera_shm, sem = open_camera_ipc()
+    except RuntimeError as exc:
+        print(f"❌ [Camera Runner] {exc}")
+        return
 
     settings_path = "./config/gemini336_settings.json"
     camera = Gemini336(
-        color_shape=color_shape, depth_shape=depth_shape, settings_path=settings_path
+        color_shape=COLOR_SHAPE,
+        depth_shape=DEPTH_SHAPE,
+        settings_path=settings_path,
     )
 
-    print("🚀 [Camera Runner] 독립 프로세스 구동 시작 (SHM & Semaphore 생성 완료)")
+    print("🚀 [Camera Runner] 독립 프로세스 구동 시작 (SHM & Semaphore 연결 완료)")
 
     try:
         while is_running:
@@ -101,7 +105,7 @@ def main():
         print(f"❌ [Camera Runner] 실행 중 예외 발생: {e}")
 
     finally:
-        print("🛑 [Camera Runner] 리소스 및 메모리 완전히 삭제 중...")
+        print("🛑 [Camera Runner] 리소스 연결 해제 중...")
         camera_shm.status = False
 
         if hasattr(camera, "stop_camera"):
@@ -113,11 +117,7 @@ def main():
                 pass
 
         camera_shm.close()
-        try:
-            sem.close()
-            sem.unlink()
-        except Exception:
-            pass
+        sem.close()
 
         print("✅ [Camera Runner] 프로세스 및 자원 해제 완료")
 
