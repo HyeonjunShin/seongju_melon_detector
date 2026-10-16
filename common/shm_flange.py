@@ -294,4 +294,4 @@ def print_terminal_dashboard(shm_name: str = "shm_flange", is_owner: bool = True
 
 if __name__ == "__main__":
     # Python에서 메모리를 Create하고 실행
-    print_terminal_dashboard(shm_name="shm_flange", is_owner=True)
+    print_terminal_dashboard(shm_name="flange_shm", is_owner=True)

@@ -451,7 +451,7 @@ def main():
     import argparse
     import signal
     import posix_ipc
-    from camera.buffer import CameraShm
+    from common.shm_camera import CameraShm
     from camera.gemini336 import color_shape, depth_shape
     from camera.camera_runner import SHM_NAME, SEM_NAME
 

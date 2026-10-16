@@ -2,7 +2,7 @@ import os
 import signal
 import sys
 import time
-from buffer import CameraShm
+from common.shm_camera import CameraShm
 import cv2
 import numpy as np
 import posix_ipc
