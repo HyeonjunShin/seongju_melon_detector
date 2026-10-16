@@ -101,7 +101,7 @@ rpds-py==2026.9.1
 safetensors==0.8.0
 scikit-learn==1.9.1
 scipy==1.18.1
--e git+ssh://git@github.com/HyeonjunShin/seongju_melon_detector.git@e18ca86b4a0bccaee2e22bedf8a26dc6ac6c54b7#egg=seongju_melon_detector
+-e git+ssh://git@github.com/HyeonjunShin/seongju_melon_detector.git@424573074e13f240d020b78f837f9ff3f8fe57ae#egg=seongju_melon_detector
 setuptools==84.0.0
 six==1.17.0
 stack-data==0.6.3
