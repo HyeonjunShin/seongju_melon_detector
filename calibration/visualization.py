@@ -62,9 +62,7 @@ def main():
         metavar=("RX", "RY", "RZ"),
         help="추가 좌표계 회전각 (degree, 기본: 0 0 0)",
     )
-    parser.add_argument(
-        "--size", type=float, default=0.05, help="좌표축 길이 (STL과 같은 단위)"
-    )
+    parser.add_argument("--size", type=float, default=0.05, help="좌표축 길이 (STL과 같은 단위)")
     args = parser.parse_args()
     if not np.all(np.isfinite([*args.xyz, *args.rpy, args.size])) or args.size <= 0:
         parser.error("위치와 각도는 유한한 수, size는 양수여야 합니다.")
@@ -82,9 +80,7 @@ def main():
 
     camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=args.size)
     camera_frame.transform(T)
-    model_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=args.size * 0.6
-    )
+    model_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=args.size * 0.6)
     if args.xyz2 is not None:
         rx2, ry2, rz2 = np.deg2rad(args.rpy2 or [0, 0, 0])
         T2 = np.eye(4)

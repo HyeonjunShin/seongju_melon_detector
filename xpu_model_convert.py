@@ -12,7 +12,7 @@ from datasets import (
     find_melon_data,
     split_data,
 )
-from model import Model, CombinedModel
+from training.model import Model, CombinedModel
 
 # =====================================================================
 # 1. Calibration 데이터셋 준비 (300장)

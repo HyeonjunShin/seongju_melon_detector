@@ -16,7 +16,7 @@ from datasets import (
     split_data,
     chamae_pack_collate_fn,
 )
-from model import Model, CombinedModel
+from training.model import Model, CombinedModel
 
 @torch.no_grad()
 def visualize_predictions(

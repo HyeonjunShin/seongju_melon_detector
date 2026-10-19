@@ -15,7 +15,7 @@ from datasets import (
     find_melon_data,
     split_data,
 )
-from model import CombinedPoseModel, DualYOLOv8PoseModel, PoseDecoderModule
+from training.model import CombinedPoseModel, DualYOLOv8PoseModel, PoseDecoderModule
 from loss import DualYOLOv8PoseLoss
 import torch.nn.functional as F
 

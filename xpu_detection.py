@@ -8,7 +8,7 @@ from multiprocessing import shared_memory
 from dataclasses import dataclass
 from scipy.spatial.transform import Rotation as R
 
-from model import DecodeModule, Model
+from training.model import DecodeModule, Model
 
 
 class BufferHeader(ctypes.Structure):

@@ -15,6 +15,8 @@ from common.ipc import ProductIpc
 
 
 class FakeCameraShm:
+    shm_name = "camera_shm"
+    index = 0
     status = True
     sequence_id = 10
     latency = 4.25
@@ -28,16 +30,23 @@ class FakeCameraShm:
 
 
 class FakeFlangeShm:
+    shm_name = "flange_shm"
+    head = 20
+    buffer_size = 100
     status = True
     sequence = 20
 
     def get_ordered_data(self):
         transform = np.eye(4)
         transform[:3, 3] = [1.1, 2.2, 3.3]
-        return [{"timestamp_us": 202, "TF": transform}], self.sequence
+        return [
+            {"timestamp_us": 202, "TF": transform}
+            for _ in range(min(self.sequence, self.buffer_size))
+        ], self.sequence
 
 
 class FakeTargetShm:
+    shm_name = "target_shm"
     status = True
     index = 0
     timestamp = 303
@@ -80,14 +89,14 @@ class MainSupervisorTest(unittest.TestCase):
 
         dashboard, _ = main.build_dashboard(ipc, previous=state, now=11.0)
 
-        self.assertIn("camera_shm  ACTIVE  30.0 Hz", dashboard)
-        self.assertIn("RGB uint8(720, 1280, 3)", dashboard)
-        self.assertIn("Depth uint16(720, 1280, 1)", dashboard)
-        self.assertIn("shm_flange ACTIVE  100.0 Hz", dashboard)
-        self.assertIn("XYZ=(1.100, 2.200, 3.300) m", dashboard)
-        self.assertIn("shm_target  ACTIVE  observed 1.0 Hz", dashboard)
-        self.assertIn("detected=True score=0.875", dashboard)
-        self.assertIn("XYZ=(4.400, 5.500, 6.600) m", dashboard)
+        self.assertRegex(dashboard, r"camera_shm\s+ACTIVE\s+30\.0 Hz\s+0\.0 s")
+        self.assertIn("RGB    1280 × 720 · uint8 · 3 ch", dashboard)
+        self.assertIn("Depth  1280 × 720 · uint16 · 1 ch", dashboard)
+        self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+100\.0 Hz\s+0\.0 s")
+        self.assertIn("위치   X 1.100000  Y 2.200000  Z 3.300000 m", dashboard)
+        self.assertRegex(dashboard, r"target_shm\s+ACTIVE\s+1\.0 Hz\s+0\.0 s")
+        self.assertIn("검출   YES · 신뢰도 0.875", dashboard)
+        self.assertIn("위치   X 4.400000  Y 5.500000  Z 6.600000 m", dashboard)
 
     def test_dashboard_reports_time_since_last_change(self):
         ipc = FakeIpc()
@@ -95,9 +104,60 @@ class MainSupervisorTest(unittest.TestCase):
 
         dashboard, _ = main.build_dashboard(ipc, previous=state, now=12.5)
 
-        self.assertEqual(dashboard.count("stale=2.5s"), 3)
-        self.assertIn("camera_shm  ACTIVE  0.0 Hz", dashboard)
-        self.assertIn("shm_target  ACTIVE  observed 0.0 Hz", dashboard)
+        self.assertEqual(dashboard.count("2.5 s"), 3)
+        self.assertRegex(dashboard, r"camera_shm\s+ACTIVE\s+0\.0 Hz\s+2\.5 s")
+        self.assertRegex(dashboard, r"target_shm\s+ACTIVE\s+0\.0 Hz\s+2\.5 s")
+
+    def test_dashboard_displays_complete_transforms_and_camera_buffer_details(self):
+        ipc = FakeIpc()
+        transform = np.array([[0., 0., 1., .123456789],
+                              [0., 1., 0., -.234567891],
+                              [-1., 0., 0., .345678912],
+                              [0., 0., 0., 1.]])
+        sample = ipc.target_shm.read()
+        sample.TF = transform
+        frame = ipc.camera_shm.read()
+        frame.depth[0, :3, 0] = [100, 200, 300]
+        with patch.object(ipc.target_shm, "read", return_value=sample), patch.object(
+            ipc.camera_shm, "read", return_value=frame
+        ):
+            dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
+        target_section = dashboard.split("\nTARGET\n")[1]
+        rows = [line.strip().strip("[]").split() for line in target_section.splitlines()
+                if line.strip().startswith("[")]
+        np.testing.assert_allclose(np.array(rows, dtype=float), transform, atol=1e-9)
+        self.assertIn("RPY (deg): roll=0.000  pitch=90.000  yaw=0.000", target_section)
+        self.assertIn("+Z (base): 1.000000  0.000000  0.000000", target_section)
+        self.assertIn("XYZ (mm): 123.457  -234.568  345.679", target_section)
+        self.assertIn("valid=3/921600", dashboard)
+        self.assertIn("min=100  median=200  max=300 mm", dashboard)
+        self.assertIn("head=20", dashboard)
+        self.assertIn("buffer=20/100", dashboard)
+        self.assertIn("timestamp=101  seq=10  index=0", dashboard)
+
+    def test_dashboard_handles_empty_depth_and_missing_flange_pose(self):
+        ipc = FakeIpc()
+        with patch.object(ipc.flange_shm, "get_ordered_data", return_value=(None, 0)):
+            dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
+        flange_section = dashboard.split("\nFLANGE\n")[1].split("\nTARGET\n")[0]
+        self.assertIn("TF: no data", flange_section)
+        self.assertIn("valid=0/921600", dashboard)
+        self.assertIn("min=-  median=-  max=- mm", dashboard)
+
+    def test_pose_display_reports_invalid_rotation_without_hiding_matrix(self):
+        transform = np.eye(4)
+        transform[0, 0] = np.nan
+        text = "\n".join(main.pose_lines(transform))
+        self.assertIn("RPY (deg): unavailable (invalid rotation)", text)
+        self.assertIn("nan", text)
+
+    def test_pose_display_uses_fixed_xyz_angles_for_combined_rotation(self):
+        c = np.sqrt(3.) / 2.
+        # 30 degrees around X, followed by 90 degrees around fixed Z.
+        transform = np.array([[0., -c, .5, 0.], [1., 0., 0., 0.],
+                              [0., .5, c, 0.], [0., 0., 0., 1.]])
+        text = "\n".join(main.pose_lines(transform))
+        self.assertIn("RPY (deg): roll=30.000  pitch=0.000  yaw=90.000", text)
 
     def test_run_owns_ipc_until_stop_event_and_then_cleans_up(self):
         suffix = uuid4().hex

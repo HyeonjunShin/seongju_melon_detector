@@ -18,7 +18,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model import DecodeModule
+from training.model import DecodeModule
 from PIL import Image, ImageDraw
 import matplotlib.pyplot as plt
 from torchvision.ops import nms, box_iou
@@ -627,7 +627,7 @@ class OneToManyDetectionLoss(nn.Module):
 
 if __name__ == "__main__":
     # Minimal smoke test; does not require loading a dataset.
-    from model import Model
+    from training.model import Model
     from datasets import (
         find_melon_data,
         split_data,

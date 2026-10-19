@@ -19,7 +19,7 @@ from datasets import (
     find_melon_data,
     split_data,
 )
-from model import DecodeModule, Model
+from training.model import DecodeModule, Model
 
 KEYPOINT_DECODE_VERSION = "anchor_stride_v1"
 TRAINING_ASSIGNMENT_VERSION = "multi_gt_tal_v3_bgweight"

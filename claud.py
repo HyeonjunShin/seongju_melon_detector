@@ -343,7 +343,7 @@ def evaluate_one2one(
     nms_iou_thres 를 주면 같은 출력에 NMS 를 적용해서, NMS 유무에 따른 차이로
     one2one 헤드가 정말 중복을 학습하지 않았는지 확인할 수 있다.
     """
-    from model import DecodeModule
+    from training.model import DecodeModule
 
     model.eval()
     decoder = (
@@ -493,7 +493,7 @@ def mean_keypoint_error(metrics) -> float:
 # 스모크 테스트: 데이터셋 없이 예시 라벨 1개로 과적합이 되는지 확인
 # ----------------------------------------------------------------------
 def smoke_test():
-    from model import Model
+    from training.model import Model
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
@@ -564,7 +564,7 @@ def visualize_one2one(
     """
     import matplotlib.pyplot as plt
     from PIL import Image, ImageDraw, ImageFont
-    from model import DecodeModule
+    from training.model import DecodeModule
 
     if not show:
         plt.switch_backend("Agg")
@@ -829,7 +829,7 @@ def main():
         find_melon_data,
         split_data,
     )
-    from model import Model
+    from training.model import Model
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="./data")

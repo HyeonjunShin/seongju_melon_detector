@@ -11,7 +11,7 @@ import torchvision.ops
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from common.shm_camera import CameraShm
-from model import Model, CombinedModel
+from training.model import Model, CombinedModel
 
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"

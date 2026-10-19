@@ -1,4 +1,4 @@
-from model import D
+from training.model import D
 
 detector = Detector(model_path="./model_int8.xml", conf_threshold=0.25)
 

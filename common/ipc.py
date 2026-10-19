@@ -12,8 +12,8 @@ class ProductIpc:
     def __init__(
         self,
         camera_shm_name: str = "camera_shm",
-        flange_shm_name: str = "shm_flange",
-        target_shm_name: str = "shm_target",
+        flange_shm_name: str = "flange_shm",
+        target_shm_name: str = "target_shm",
         camera_sem_name: str = "/camera_sem",
         lock_path: str = "/tmp/seongju_melon_detector.lock",
     ):
