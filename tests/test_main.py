@@ -40,8 +40,8 @@ class FakeFlangeShm:
         transform = np.eye(4)
         transform[:3, 3] = [1.1, 2.2, 3.3]
         return [
-            {"timestamp_us": 202, "TF": transform}
-            for _ in range(min(self.sequence, self.buffer_size))
+            {"timestamp_us": 202 + i * 2000, "TF": transform}
+            for i in range(min(self.sequence, self.buffer_size))
         ], self.sequence
 
 
@@ -92,11 +92,27 @@ class MainSupervisorTest(unittest.TestCase):
         self.assertRegex(dashboard, r"camera_shm\s+ACTIVE\s+30\.0 Hz\s+0\.0 s")
         self.assertIn("RGB    1280 × 720 · uint8 · 3 ch", dashboard)
         self.assertIn("Depth  1280 × 720 · uint16 · 1 ch", dashboard)
-        self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+100\.0 Hz\s+0\.0 s")
+        self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+500\.0 Hz\s+0\.0 s")
         self.assertIn("위치   X 1.100000  Y 2.200000  Z 3.300000 m", dashboard)
         self.assertRegex(dashboard, r"target_shm\s+ACTIVE\s+1\.0 Hz\s+0\.0 s")
         self.assertIn("검출   YES · 신뢰도 0.875", dashboard)
         self.assertIn("위치   X 4.400000  Y 5.500000  Z 6.600000 m", dashboard)
+
+    def test_flange_timing_uses_buffer_timestamps(self):
+        ipc = FakeIpc()
+        for timestamps, expected in [
+            ([1000000, 1001900, 1004000], "평균=2.000 ms  최소=1.900 ms  최대=2.100 ms"),
+            ([1000000], "주기: 측정 불가"),
+            ([1000000, 1000000], "주기: 측정 불가"),
+            ([1000000, 999000], "주기: 측정 불가"),
+        ]:
+            with self.subTest(timestamps=timestamps):
+                data = [{"timestamp_us": ts, "TF": np.eye(4)} for ts in timestamps]
+                with patch.object(ipc.flange_shm, "get_ordered_data", return_value=(data, 100)):
+                    dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
+                self.assertIn(expected, dashboard)
+                if len(timestamps) == 3:
+                    self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+500\.0 Hz")
 
     def test_dashboard_reports_time_since_last_change(self):
         ipc = FakeIpc()

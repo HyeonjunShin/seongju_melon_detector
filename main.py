@@ -74,6 +74,23 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
                 delta = current - previous["counters"][name]
                 rates[name] = max(delta, 0) / elapsed if elapsed else 0.0
 
+    # Measure the producer's sampling interval from the recent buffer,
+    # independently of the dashboard's refresh interval.
+    flange_timing = "  주기: 측정 불가 (데이터 부족 또는 timestamp 중복/역행)"
+    rates["flange"] = 0.0
+    if flange_data is not None and len(flange_data) >= 2:
+        timestamps = np.array([row["timestamp_us"] for row in flange_data], dtype=np.int64)
+        intervals_us = np.diff(timestamps)
+        if np.all(intervals_us > 0):
+            mean_us = intervals_us.mean()
+            rates["flange"] = 1_000_000.0 / mean_us
+            flange_timing = (
+                f"  주기 (timestamp 기준): 평균={mean_us / 1000:.3f} ms  "
+                f"최소={intervals_us.min() / 1000:.3f} ms  "
+                f"최대={intervals_us.max() / 1000:.3f} ms  "
+                f"간격 수={len(intervals_us)}"
+            )
+
     stale = {name: now - changed_at for name, changed_at in last_change.items()}
     camera_state = "ACTIVE" if camera.status else "IDLE"
     flange_state = "ACTIVE" if flange.status else "IDLE"
@@ -116,6 +133,7 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
         "FLANGE",
         f"  timestamp_us={flange_timestamp}  seq={counters['flange']}  head={flange.head}",
         f"  buffer={len(flange_data) if flange_data is not None else 0}/{flange.buffer_size}",
+        flange_timing,
         *pose_lines(flange_tf),
         "",
         "TARGET",
@@ -125,7 +143,8 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
         *pose_lines(target_latest.TF if target_latest.timestamp > 0 else None),
         "=" * 72,
         "TF/XYZ/+Z: robot base frame | RPY: fixed XYZ, R=Rz(yaw)@Ry(pitch)@Rx(roll)",
-        "Ctrl+C: 종료 | target Hz는 polling으로 관측된 값입니다.",
+        "Ctrl+C: 종료 | flange Hz: 버퍼 timestamp 기준 (수신 중단 시 마지막 값 유지)",
+        "target Hz는 polling으로 관측된 값입니다.",
     ]
     state = {"time": now, "counters": counters, "last_change": last_change}
     return "\n".join(lines), state

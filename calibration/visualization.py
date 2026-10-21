@@ -13,6 +13,10 @@ python visualization.py --no-gui \
   --rpy2 0 0 0
 """
 
+"""
+0.05256 + 0.1325 = 0.18506
+"""
+
 import argparse
 from pathlib import Path
 
