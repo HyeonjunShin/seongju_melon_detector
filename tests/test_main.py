@@ -71,6 +71,20 @@ class FakeIpc:
 
 
 class MainSupervisorTest(unittest.TestCase):
+    def test_flange_buffer_duplicate_timestamps(self):
+        ipc = FakeIpc()
+        for timestamps, expected in [
+            ([], "timestamp 중복: 없음"),
+            ([10, 20, 30], "timestamp 중복: 없음"),
+            ([10, 20, 10, 20, 10], "timestamp 중복: 10 us × 3회, 20 us × 2회"),
+        ]:
+            with self.subTest(timestamps=timestamps):
+                data = [{"timestamp_us": ts, "TF": np.eye(4)} for ts in timestamps]
+                with patch.object(ipc.flange_shm, "get_ordered_data",
+                                  return_value=(data or None, len(data))):
+                    dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
+                self.assertIn(expected, dashboard)
+
     def test_print_dashboard_always_clears_previous_frame(self):
         output = io.StringIO()
 
@@ -92,27 +106,32 @@ class MainSupervisorTest(unittest.TestCase):
         self.assertRegex(dashboard, r"camera_shm\s+ACTIVE\s+30\.0 Hz\s+0\.0 s")
         self.assertIn("RGB    1280 × 720 · uint8 · 3 ch", dashboard)
         self.assertIn("Depth  1280 × 720 · uint16 · 1 ch", dashboard)
-        self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+500\.0 Hz\s+0\.0 s")
+        self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+100\.0 Hz\s+0\.0 s")
         self.assertIn("위치   X 1.100000  Y 2.200000  Z 3.300000 m", dashboard)
         self.assertRegex(dashboard, r"target_shm\s+ACTIVE\s+1\.0 Hz\s+0\.0 s")
         self.assertIn("검출   YES · 신뢰도 0.875", dashboard)
         self.assertIn("위치   X 4.400000  Y 5.500000  Z 6.600000 m", dashboard)
 
-    def test_flange_timing_uses_buffer_timestamps(self):
+    def test_flange_timing_uses_sequence_delta_and_elapsed_time(self):
         ipc = FakeIpc()
-        for timestamps, expected in [
-            ([1000000, 1001900, 1004000], "평균=2.000 ms  최소=1.900 ms  최대=2.100 ms"),
-            ([1000000], "주기: 측정 불가"),
-            ([1000000, 1000000], "주기: 측정 불가"),
-            ([1000000, 999000], "주기: 측정 불가"),
+        dashboard, state = main.build_dashboard(ipc, previous=None, now=10.)
+        self.assertIn("주기: 측정 불가", dashboard)
+        # Buffer timestamps remain 2 ms apart; measure actual writes instead.
+        for delta, elapsed, hz, period in [
+            (250, .5, 500., "2.000"),
+            (1000, 1., 1000., "1.000"),
+            (0, 1., 0., None),
+            (-10, 1., 0., None),
+            (10, 0., 0., None),
         ]:
-            with self.subTest(timestamps=timestamps):
-                data = [{"timestamp_us": ts, "TF": np.eye(4)} for ts in timestamps]
-                with patch.object(ipc.flange_shm, "get_ordered_data", return_value=(data, 100)):
-                    dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
-                self.assertIn(expected, dashboard)
-                if len(timestamps) == 3:
-                    self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+500\.0 Hz")
+            with self.subTest(delta=delta, elapsed=elapsed):
+                ipc.flange_shm.sequence = state["counters"]["flange"] + delta
+                dashboard, _ = main.build_dashboard(ipc, previous=state, now=10. + elapsed)
+                self.assertRegex(dashboard, rf"flange_shm\s+ACTIVE\s+{hz:.1f} Hz")
+                if period is None:
+                    self.assertIn("주기: 측정 불가", dashboard)
+                else:
+                    self.assertIn(f"평균={period} ms", dashboard)
 
     def test_dashboard_reports_time_since_last_change(self):
         ipc = FakeIpc()

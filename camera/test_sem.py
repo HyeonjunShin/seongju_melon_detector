@@ -78,18 +78,10 @@ def main():
                 continue
 
             # 💡 [제품 조건 1] 카메라 프로세스/하드웨어 정상 동작 가드
-            if not camera_shm.status:
+            frame = camera_shm.read(last_sequence_id=last_sequence_id)
+            if frame is None:
                 continue
-
-            # 💡 [제품 조건 2] sequence_id 기반 최신 프레임 갱신 여부 검증
-            current_seq = camera_shm.sequence_id
-            if current_seq <= last_sequence_id:
-                # 세마포어 백로그 또는 중복 접근 시 무시 (46 FPS 오버카운팅 방지)
-                continue
-
-            # 공유 메모리에서 최신 프레임 수신 및 시퀀스 최신화
-            frame = camera_shm.read()
-            last_sequence_id = current_seq
+            last_sequence_id = frame.sequence_id
 
             color_data = frame.color
             depth_data = frame.depth

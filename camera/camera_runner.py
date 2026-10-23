@@ -42,7 +42,7 @@ def open_camera_ipc() -> tuple[CameraShm, posix_ipc.Semaphore]:
 
 def main():
     global is_running
-    sequence_id = 0
+    is_running = True
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -59,16 +59,16 @@ def main():
         print(f"❌ [Camera Runner] {exc}")
         return
 
-    settings_path = "./config/gemini336_settings.json"
-    camera = Gemini336(
-        color_shape=COLOR_SHAPE,
-        depth_shape=DEPTH_SHAPE,
-        settings_path=settings_path,
-    )
-
-    print("🚀 [Camera Runner] 독립 프로세스 구동 시작 (SHM & Semaphore 연결 완료)")
-
+    camera = None
     try:
+        camera_shm.status = False
+        camera = Gemini336(
+            color_shape=COLOR_SHAPE,
+            depth_shape=DEPTH_SHAPE,
+            settings_path="./config/gemini336_settings.json",
+        )
+        print("🚀 [Camera Runner] 독립 프로세스 구동 시작 (SHM & Semaphore 연결 완료)")
+
         while is_running:
             frame = camera.get_frame()
             if frame is None:
@@ -83,8 +83,6 @@ def main():
                 time.sleep(0.001)
                 continue
 
-            camera_shm.status = True
-
             timestamp = depth.get_global_timestamp_us()
             color_data = color.get_data()
             depth_data = depth.get_data()
@@ -92,12 +90,10 @@ def main():
             # Shared Memory에 프레임 쓰기
             camera_shm.write(timestamp, color_data, depth_data)
 
-            # 💡 [수정 완료] @property setter 형태 대입 구문으로 변경
-            sequence_id += 1
-            camera_shm.sequence_id = sequence_id
-
-            # 세마포어 신호(Signal) 전송 -> 수신부 프로세스 깨우기
-            sem.release()
+            # One pending wake-up is enough: consumers always read the latest
+            # snapshot. This channel has a single producer.
+            if sem.value == 0:
+                sem.release()
 
             time.sleep(0.001)
 
@@ -108,16 +104,16 @@ def main():
         print("🛑 [Camera Runner] 리소스 연결 해제 중...")
         camera_shm.status = False
 
-        if hasattr(camera, "stop_camera"):
-            camera.stop_camera()
-        elif hasattr(camera, "pipeline") and camera.pipeline:
+        try:
+            if camera is not None:
+                camera.stop_camera()
+        except Exception as exc:
+            print(f"❌ [Camera Runner] 카메라 정지 중 예외 발생: {exc}")
+        finally:
             try:
-                camera.pipeline.stop()
-            except Exception:
-                pass
-
-        camera_shm.close()
-        sem.close()
+                camera_shm.close()
+            finally:
+                sem.close()
 
         print("✅ [Camera Runner] 프로세스 및 자원 해제 완료")
 

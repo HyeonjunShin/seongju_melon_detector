@@ -1,3 +1,7 @@
+import fcntl
+import threading
+from contextlib import contextmanager
+
 import numpy as np
 from multiprocessing import shared_memory
 from dataclasses import dataclass
@@ -9,6 +13,7 @@ class Frame:
     timestamp: int
     color: np.ndarray
     depth: np.ndarray
+    sequence_id: int = 0
 
 
 class CameraShm:
@@ -21,6 +26,7 @@ class CameraShm:
     ):
         self._shm_name = shm_name
         self.is_owner = is_owner
+        self._local_lock = threading.Lock()
 
         self.color_shape = color_shape
         self.depth_shape = depth_shape
@@ -43,8 +49,7 @@ class CameraShm:
         )
 
         self.header_bytes = self.header_dtype.itemsize
-        self.total_bytes = self.header_bytes + (self.frame_dtype.itemsize * 2)
-        # Because two slot
+        self.total_bytes = self.header_bytes + self.frame_dtype.itemsize
 
         if self.is_owner:
             self.shm = shared_memory.SharedMemory(
@@ -59,7 +64,7 @@ class CameraShm:
             (1,), dtype=self.header_dtype, buffer=self.shm.buf
         )
         self.slots = np.ndarray(
-            (2,), dtype=self.frame_dtype, buffer=self.shm.buf, offset=self.header_bytes
+            (1,), dtype=self.frame_dtype, buffer=self.shm.buf, offset=self.header_bytes
         )
 
     @property
@@ -102,65 +107,59 @@ class CameraShm:
     def sequence_id(self, val: int):
         self._header_arr[0]["sequence_id"] = val
 
+    @contextmanager
+    def _frame_lock(self, operation):
+        # flock coordinates independently opened SHM descriptors across processes;
+        # the local lock also serializes threads sharing this instance.
+        with self._local_lock:
+            fcntl.flock(self.shm._fd, operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(self.shm._fd, fcntl.LOCK_UN)
+
     def write(
         self,
         timestamp: int | np.uint64,
         color_data: np.ndarray | None = None,
         depth_data: np.ndarray | None = None,
     ):
-        next_idx = 1 - self.index
-        target_slot = self.slots[next_idx]
+        # Validate shapes before touching the published frame.
+        color = None if color_data is None else color_data.reshape(self.color_shape)
+        depth = (None if depth_data is None else
+                 depth_data.view(np.uint16).reshape(self.depth_shape))
+        with self._frame_lock(fcntl.LOCK_EX):
+            # If a write fails or the writer exits midway, consumers must not
+            # accept a partially updated frame as a new valid snapshot.
+            self.status = False
+            slot = self.slots[0]
+            slot["timestamp"] = timestamp
+            if color is not None:
+                slot["color"][:] = color
+            if depth is not None:
+                slot["depth"][:] = depth
+            self.sequence_id = int(self.sequence_id) + 1
+            self.status = True
 
-        target_slot["timestamp"] = timestamp
+    def read(self, last_sequence_id: int | None = None) -> Frame | None:
+        """Copy the latest frame; optionally skip inactive or already-read data.
 
-        if color_data is not None:
-            target_slot["color"][:] = color_data.reshape(self.color_shape)
-
-        if depth_data is not None:
-            target_slot["depth"][:] = depth_data.view(np.uint16).reshape(
-                self.depth_shape
+        The returned arrays belong to the consumer. Process them after this
+        method returns, outside the shared-memory lock. No frames are queued.
+        """
+        with self._frame_lock(fcntl.LOCK_SH):
+            sequence_id = int(self.sequence_id)
+            if last_sequence_id is not None and (
+                not self.status or sequence_id <= last_sequence_id
+            ):
+                return None
+            slot = self.slots[0]
+            return Frame(
+                timestamp=int(slot["timestamp"]),
+                color=slot["color"].copy(),
+                depth=slot["depth"].copy(),
+                sequence_id=sequence_id,
             )
-
-        self.index = next_idx
-
-    # def write(
-    #     self,
-    #     timestamp: np.uint64,
-    #     color_data: np.ndarray,
-    #     depth_data: np.ndarray,
-    # ):
-    #     next_idx = 1 - self.header.index
-    #     target_slot = self.slots[next_idx]
-
-    #     target_slot["timestamp"][0] = timestamp
-
-    #     if color_data is not None:
-    #         np.copyto(target_slot["color"], color_data.reshape(self.color_shape))
-
-    #     if depth_data is not None:
-    #         depth_data_u16 = depth_data.view(np.uint16)
-    #         np.copyto(target_slot["depth"], depth_data_u16.reshape(self.depth_shape))
-
-    #     self.header.index = next_idx
-
-    def read(self) -> Frame:
-        slot = self.slots[self.index]
-
-        return Frame(
-            timestamp=int(slot["timestamp"]),
-            color=slot["color"],
-            depth=slot["depth"],
-        )
-
-    # def get_latest_frame(self) -> Frame:
-    #     latest_idx = self.header.index
-    #     slot = self.slots[latest_idx]
-
-    #     return Frame(
-    #         timestamp=int(slot["timestamp"][0]),
-    #         color=slot["color"],
-    #         depth=slot["depth"],
-    #     )
 
     def close(self):
         """메모리 참조 해제 및 Shared Memory 닫기"""

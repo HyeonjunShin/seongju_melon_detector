@@ -410,18 +410,13 @@ def main():
             except posix_ipc.BusyError:
                 continue
 
-            if not camera_shm.status:
+            frame = camera_shm.read(last_sequence_id=last_sequence_id)
+            if frame is None:
                 continue
+            last_sequence_id = frame.sequence_id
 
-            current_seq = camera_shm.sequence_id
-            if current_seq <= last_sequence_id:
-                continue
-
-            frame = camera_shm.read()
-            last_sequence_id = current_seq
-
-            color_img = frame.color.reshape(COLOR_SHAPE).copy()
-            depth_img = frame.depth.reshape(DEPTH_SHAPE).reshape(IMAGE_HEIGHT, IMAGE_WIDTH).copy()
+            color_img = frame.color.reshape(COLOR_SHAPE)
+            depth_img = frame.depth.reshape(IMAGE_HEIGHT, IMAGE_WIDTH)
             latest["depth"] = depth_img
             latest["timestamp"] = frame.timestamp
 

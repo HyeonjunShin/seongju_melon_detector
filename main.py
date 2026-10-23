@@ -2,6 +2,7 @@ import signal
 import sys
 import threading
 import time
+from collections import Counter
 
 import numpy as np
 
@@ -49,6 +50,13 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
     frame = camera.read()
     flange_data, flange_sequence = flange.get_ordered_data()
     flange_latest = flange_data[-1] if flange_data is not None else None
+    flange_timestamp_counts = Counter(
+        int(row["timestamp_us"]) for row in flange_data
+    ) if flange_data is not None else Counter()
+    flange_duplicates = ", ".join(
+        f"{timestamp} us × {count}회"
+        for timestamp, count in flange_timestamp_counts.items() if count > 1
+    ) or "없음"
     target_latest = target.read()
 
     counters = {
@@ -74,22 +82,14 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
                 delta = current - previous["counters"][name]
                 rates[name] = max(delta, 0) / elapsed if elapsed else 0.0
 
-    # Measure the producer's sampling interval from the recent buffer,
-    # independently of the dashboard's refresh interval.
-    flange_timing = "  주기: 측정 불가 (데이터 부족 또는 timestamp 중복/역행)"
-    rates["flange"] = 0.0
-    if flange_data is not None and len(flange_data) >= 2:
-        timestamps = np.array([row["timestamp_us"] for row in flange_data], dtype=np.int64)
-        intervals_us = np.diff(timestamps)
-        if np.all(intervals_us > 0):
-            mean_us = intervals_us.mean()
-            rates["flange"] = 1_000_000.0 / mean_us
-            flange_timing = (
-                f"  주기 (timestamp 기준): 평균={mean_us / 1000:.3f} ms  "
-                f"최소={intervals_us.min() / 1000:.3f} ms  "
-                f"최대={intervals_us.max() / 1000:.3f} ms  "
-                f"간격 수={len(intervals_us)}"
-            )
+    flange_timing = "  주기: 측정 불가 (이전 데이터 없음 또는 새 데이터 없음)"
+    if rates["flange"] > 0:
+        flange_timing = (
+            f"  주기 (이전/현재 sequence·경과 시간 기준): "
+            f"평균={1000.0 / rates['flange']:.3f} ms  "
+            f"수신 수={counters['flange'] - previous['counters']['flange']}  "
+            f"경과={elapsed:.3f} s"
+        )
 
     stale = {name: now - changed_at for name, changed_at in last_change.items()}
     camera_state = "ACTIVE" if camera.status else "IDLE"
@@ -133,6 +133,7 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
         "FLANGE",
         f"  timestamp_us={flange_timestamp}  seq={counters['flange']}  head={flange.head}",
         f"  buffer={len(flange_data) if flange_data is not None else 0}/{flange.buffer_size}",
+        f"  버퍼 내 timestamp 중복: {flange_duplicates}",
         flange_timing,
         *pose_lines(flange_tf),
         "",
@@ -143,7 +144,7 @@ def build_dashboard(ipc, previous: dict | None, now: float) -> tuple[str, dict]:
         *pose_lines(target_latest.TF if target_latest.timestamp > 0 else None),
         "=" * 72,
         "TF/XYZ/+Z: robot base frame | RPY: fixed XYZ, R=Rz(yaw)@Ry(pitch)@Rx(roll)",
-        "Ctrl+C: 종료 | flange Hz: 버퍼 timestamp 기준 (수신 중단 시 마지막 값 유지)",
+        "Ctrl+C: 종료 | flange Hz: 이전/현재 sequence 증가량 ÷ 실제 경과 시간",
         "target Hz는 polling으로 관측된 값입니다.",
     ]
     state = {"time": now, "counters": counters, "last_change": last_change}
