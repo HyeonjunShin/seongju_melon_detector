@@ -13,9 +13,9 @@
 	"color_sharpness": 50,
 	"color_white_balance": 4000,
 	"depth_alg_mode": "G33X Close Range High Accuracy",
-	"depth_auto_exposure": 1,
-	"depth_exposure_time": 3000,
-	"depth_gain": 16,
+	"depth_auto_exposure": 0,
+	"depth_exposure_time": 1500,
+	"depth_gain": 25,
 	"laser_power_level": 6,
 	"laser_state": 1,
 	"target_mean_intensity": 60

@@ -1,0 +1,30 @@
+[
+  {
+    "label": "0",
+    "color": "#3794ff",
+    "bbox": {
+      "xmin": 306.5,
+      "ymin": 106,
+      "xmax": 462.2,
+      "ymax": 360.9
+    },
+    "keypoints": [
+      {
+        "name": "body_center",
+        "point": [
+          381.3,
+          278.4
+        ],
+        "visibility": 1
+      },
+      {
+        "name": "knot_center",
+        "point": [
+          371.9,
+          123.7
+        ],
+        "visibility": 1
+      }
+    ]
+  }
+]

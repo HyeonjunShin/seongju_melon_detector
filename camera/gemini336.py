@@ -7,7 +7,9 @@ from pyorbbecsdk import (
     OBSensorType,
     OBFormat,
     OBPropertyID,
+    OBAlignMode
 )
+
 import numpy as np
 
 # 카메라 파라미터
@@ -38,8 +40,6 @@ D = np.array(
     ],
     dtype=np.float32,
 )
-color_shape = (1280, 720, 3)
-depth_shape = (1280, 720, 1)
 
 
 check_params = [
@@ -214,6 +214,7 @@ class Gemini336:
         except Exception as e:
             print(f"Depth 프로필 설정 실패: {e}")
 
+        config.set_align_mode(OBAlignMode.HW_MODE)
         pipeline.start(config)
 
         print_intrinsics(pipeline)
