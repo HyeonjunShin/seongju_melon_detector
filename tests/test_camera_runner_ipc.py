@@ -41,6 +41,8 @@ assert Path(common.shm_camera.__file__).resolve() == Path({str(root / 'common/sh
             camera_shm_name=self.camera_name,
             flange_shm_name=f"flange_runner_{suffix}",
             target_shm_name=f"target_runner_{suffix}",
+            detection_shm_name=f"detection_runner_{suffix}",
+            tracking_shm_name=f"tracking_runner_{suffix}",
             camera_sem_name=self.sem_name,
             lock_path=str(Path(self.tempdir.name) / "supervisor.lock"),
         )

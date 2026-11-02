@@ -8,13 +8,14 @@ from pyorbbecsdk import (
     OBAlignMode,
     DepthFrame,
     ColorFrame,
-    VideoFrame
+    VideoFrame,
 )
 import cv2
 import numpy as np
 import os
 
 selected_points = []
+
 
 def frame_to_bgr_image(frame: VideoFrame):
     width = frame.get_width()
@@ -38,7 +39,7 @@ def frame_to_bgr_image(frame: VideoFrame):
         return None
     return image
 
-    
+
 def save_depth_frame(frame: DepthFrame, timestamp):
     if frame is None:
         return
@@ -52,15 +53,14 @@ def save_depth_frame(frame: DepthFrame, timestamp):
         return
     data = np.frombuffer(frame.get_data(), dtype=np.uint16)
     data = data.reshape((height, width))
-    data = data.astype(np.float32) * scale
-    data = data.astype(np.uint16)
+    data = data.astype(np.float32) * (scale * 0.001)  # meters
     save_image_dir = os.path.join(os.getcwd(), "outputs/depth_images")
     if not os.path.exists(save_image_dir):
         os.makedirs(save_image_dir, exist_ok=True)
-    filename = save_image_dir + "/depth_{}_{}_{}.png".format(width, height, timestamp)
-    params = [cv2.IMWRITE_PNG_COMPRESSION, 0]
-    cv2.imwrite(filename, data, params)
+    filename = save_image_dir + "/depth_{}_{}_{}.npy".format(width, height, timestamp)
+    np.save(filename, data)
     print(f"Depth saved: {filename}")
+
 
 def save_color_frame(frame: ColorFrame, timestamp):
     if frame is None:
@@ -80,7 +80,6 @@ def save_color_frame(frame: ColorFrame, timestamp):
     print(f"Color saved: {filename}")
 
 
-
 def mouse_callback(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         if len(selected_points) == 2:
@@ -91,7 +90,7 @@ def mouse_callback(event, x, y, flags, param):
 def main():
     color_shape = (848, 530, 3, 60)
     depth_shape = (848, 530, 1, 60)
-    config_file_path = "./config/gemini305_settings.json"
+    config_file_path = "./config/gemini355_settings.json"
 
     # color_shape = (424, 240, 3, 60)
     # depth_shape = (480, 270, 1, 60)
@@ -131,16 +130,15 @@ def main():
     # print(pipeline)
     # exit()
 
-
     color_profile_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
     color_profile = color_profile_list.get_video_stream_profile(
-                    color_shape[0], color_shape[1], OBFormat.RGB, color_shape[3]
-                )
+        color_shape[0], color_shape[1], OBFormat.MJPG, color_shape[3]
+    )
 
     depth_profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
     depth_profile = depth_profile_list.get_video_stream_profile(
-                    depth_shape[0], depth_shape[1], OBFormat.Y16, depth_shape[3]
-                )
+        depth_shape[0], depth_shape[1], OBFormat.Y16, depth_shape[3]
+    )
 
     config.enable_stream(depth_profile)
     config.enable_stream(color_profile)
@@ -152,7 +150,6 @@ def main():
     current_depth_work_mode = device.get_depth_work_mode()
     assert current_depth_work_mode is not None
     print("Current depth work mode: ", current_depth_work_mode)
-
 
     param = pipeline.get_camera_param()
     intr = param.rgb_intrinsic
@@ -182,17 +179,20 @@ def main():
             c_width, c_height = color_frame.get_width(), color_frame.get_height()
             d_width, d_height = depth_frame.get_width(), depth_frame.get_height()
 
-            color_data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
-            color_img = color_data.reshape((c_height, c_width, 3))
+            color_img = cv2.imdecode(color_frame.get_data(), cv2.IMREAD_COLOR_RGB)
+            # color_data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+            # color_img = color_data.reshape((c_height, c_width, 3))
 
             depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
             raw_depth_img = depth_data.reshape((d_height, d_width))
+            # print(raw_depth_img.max())
+            # invalid_mask = (raw_depth_img == 65535) | (raw_depth_img == 0)
 
-            invalid_mask = (raw_depth_img == 65535) | (raw_depth_img == 0)
-
-            depth_img = raw_depth_img.astype(np.float32) * depth_frame.get_depth_scale() # mm
-            depth_img = depth_img * 0.001 # m
-            depth_img[invalid_mask] = 0
+            depth_img = (
+                raw_depth_img.astype(np.float32) * depth_frame.get_depth_scale()
+            )  # mm
+            depth_img = depth_img * 0.001  # m
+            # depth_img[invalid_mask] = 0
 
             color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
 
@@ -215,21 +215,28 @@ def main():
                 else:
                     x = (u - cx) * z / fx
                     y = (v - cy) * z / fy
-                    text = (
-                        f"P{index} ({u}, {v}) "
-                        f"XYZ=({x:.4f}, {y:.4f}, {z:.4f}) m"
-                    )
+                    text = f"P{index} ({u}, {v}) " f"XYZ=({x:.4f}, {y:.4f}, {z:.4f}) m"
 
                 point_color = (0, 255, 0) if index == 1 else (0, 255, 255)
                 for image in (color_img, blended_img):
                     cv2.circle(image, (u, v), 5, point_color, -1)
                     cv2.putText(
-                        image, f"P{index}", (u + 8, v - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, point_color, 2,
+                        image,
+                        f"P{index}",
+                        (u + 8, v - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        point_color,
+                        2,
                     )
                     cv2.putText(
-                        image, text, (10, 28 * index),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, point_color, 1,
+                        image,
+                        text,
+                        (10, 28 * index),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        point_color,
+                        1,
                     )
 
             cv2.imshow("Color Stream", color_img)
@@ -245,7 +252,6 @@ def main():
                 timestamp = color_frame.get_system_timestamp_us()
                 save_color_frame(color_frame, timestamp)
                 save_depth_frame(depth_frame, timestamp)
-                
 
         except KeyboardInterrupt:
             break

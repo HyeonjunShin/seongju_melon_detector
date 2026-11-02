@@ -1,0 +1,61 @@
+{
+  "contract": "bgr848_integrated_v1",
+  "shape": [
+    1,
+    530,
+    848,
+    3
+  ],
+  "input_size": [
+    848,
+    530
+  ],
+  "model_input_size": [
+    416,
+    256
+  ],
+  "input_dtype": "uint8",
+  "input_format": "BGR",
+  "output_names": [
+    "detections",
+    "flags"
+  ],
+  "confidence": 0.3,
+  "visibility_threshold": 0.5,
+  "max_objects": 5,
+  "nms": false,
+  "checkpoint_sha256": "c541753592282942de6ae42a26a9d2e34b57ad56e2c9f66fe4f372772ce04525",
+  "onnx_sha256": "de98e4ba46b5fc4a3dd8e1233f08a9622bb8aed551485aafa7670f93997308f1",
+  "verification_samples": 10,
+  "max_normalized_preprocess_difference_vs_pil": 0.017507314682006836,
+  "max_ort_output_difference": 0.0001220703125,
+  "detections_columns": [
+    "score",
+    "x0",
+    "y0",
+    "x1",
+    "y1",
+    "body_x",
+    "body_y",
+    "knot_x",
+    "knot_y",
+    "body_probability",
+    "knot_probability",
+    "angle_deg"
+  ],
+  "flags_columns": [
+    "valid",
+    "body_visible",
+    "knot_visible",
+    "angle_valid"
+  ],
+  "gpu": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "compute_capability": [
+    12,
+    0
+  ],
+  "tensorrt": "10.14.1.48.post1",
+  "precision": "FP16-enabled mixed precision",
+  "engine_sha256": "91e390e48c4c4b8035033bddf14e28a5dedda6ac877577d043f3a6e7620514de",
+  "torch": "2.14.1+cu130"
+}

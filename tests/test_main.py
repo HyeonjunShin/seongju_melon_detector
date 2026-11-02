@@ -24,8 +24,12 @@ class FakeCameraShm:
     def read(self):
         return SimpleNamespace(
             timestamp=101,
+            timestamp_color=101,
+            timestamp_depth=105,
+            interval_color_us=16667.,
+            interval_depth_us=33334.,
             color=np.zeros((720, 1280, 3), dtype=np.uint8),
-            depth=np.zeros((720, 1280, 1), dtype=np.uint16),
+            depth=np.zeros((720, 1280, 1), dtype=np.float32),
         )
 
 
@@ -71,6 +75,69 @@ class FakeIpc:
 
 
 class MainSupervisorTest(unittest.TestCase):
+    def test_dashboard_shows_multi_object_detection_poses(self):
+        from common.shm_detection import DetectionFrame, OBJECT_DTYPE
+        objects = np.zeros(2, dtype=OBJECT_DTYPE)
+        objects['TF'] = np.eye(4)
+        objects['TF'][0, :3, 3] = [.1, .2, .3]
+        objects['score'] = [.9, .8]
+        frame = DetectionFrame(True, 123, 7, objects)
+        dashboard, _ = main.build_dashboard(FakeIpc(), None, 10., detection=frame)
+        section = dashboard.split('\nDETECTIONS (robot base)\n')[1]
+        self.assertIn('count=2/8', section)
+        self.assertIn('timestamp=123  seq=7', section)
+        self.assertIn('P1 score=0.900', section)
+        self.assertIn('P2 score=0.800', section)
+        self.assertIn('X 0.100000  Y 0.200000  Z 0.300000', section)
+        self.assertEqual(section.count('TF (4x4'), 2)
+
+    def test_detection_monitor_waits_for_detector(self):
+        dashboard, _ = main.build_dashboard(FakeIpc(), None, 10.)
+        self.assertIn('detection_shm: WAITING', dashboard)
+
+    def test_summary_orders_components_and_uses_actual_detector_publications(self):
+        from common.shm_detection import DetectionFrame, OBJECT_DTYPE
+        frame = DetectionFrame(True, 123, 100, np.zeros(0, dtype=OBJECT_DTYPE),
+                               publication_count=10, latency_ms=12.34, interval_us=33333.)
+        _, previous = main.build_dashboard(FakeIpc(), None, 10., frame, compact=True)
+        frame.publication_count += 24
+        frame.sequence_id += 60  # Camera sequence jumps must not inflate detector FPS.
+        text, _ = main.build_dashboard(FakeIpc(), previous, 11., frame, compact=True)
+        summary = text.split('\nCAMERA\n')[0]
+        self.assertLess(summary.index('Robot '), summary.index('Camera '))
+        self.assertLess(summary.index('Camera '), summary.index('Detector '))
+        self.assertRegex(summary, r'NAME.*STATUS.*RATE.*PERIOD.*TIMESTAMP')
+        detector_row = next(line for line in summary.splitlines() if line.startswith('Detector '))
+        self.assertIn('24.0 Hz', detector_row)
+        self.assertIn('33.333 ms', detector_row)
+        self.assertTrue(detector_row.endswith('123'))
+        robot_row = next(line for line in summary.splitlines() if line.startswith('Robot '))
+        self.assertIn('2.000 ms', robot_row)
+        camera_row = next(line for line in summary.splitlines() if line.startswith('Camera '))
+        self.assertIn('16.667 ms', camera_row)
+
+    def test_tracker_table_shows_id_velocity_and_observation_state(self):
+        from common.shm_detection import DetectionFrame
+        from detector.tracker import MultiObjectTracker
+        from tests.test_tracker import detections
+        rows = MultiObjectTracker(min_hits=1).update(1000000, detections([.1, .2, .3]))
+        rows['velocity'][0] = [.1, -.2, 0.]
+        sample = DetectionFrame(True, 1000000, 10, rows)
+        text, _ = main.build_dashboard(FakeIpc(), None, 10., tracking=sample, compact=True)
+        section = text.split('\nTRACKS (robot base)\n')[1]
+        self.assertIn('VX(m/s)', section)
+        self.assertIn('TRACKED', section)
+        self.assertIn('+0.100', section)
+        self.assertIn('-0.200', section)
+        self.assertIn('sigma', section)
+
+    def test_camera_shows_producer_intervals_instead_of_dashboard_poll_interval(self):
+        ipc = FakeIpc()
+        _, state = main.build_dashboard(ipc, previous=None, now=10.)
+        dashboard, _ = main.build_dashboard(ipc, previous=state, now=11.)
+        self.assertIn('Color timestamp=101 us  Δt=16.667 ms', dashboard)
+        self.assertIn('Depth timestamp=105 us  Δt=33.334 ms', dashboard)
+
     def test_flange_buffer_duplicate_timestamps(self):
         ipc = FakeIpc()
         for timestamps, expected in [
@@ -85,13 +152,53 @@ class MainSupervisorTest(unittest.TestCase):
                     dashboard, _ = main.build_dashboard(ipc, previous=None, now=10.)
                 self.assertIn(expected, dashboard)
 
-    def test_print_dashboard_always_clears_previous_frame(self):
+    def test_redirected_dashboard_has_no_terminal_escape_codes(self):
         output = io.StringIO()
 
         with patch.object(main.sys, "stdout", output):
             main.print_dashboard("new frame")
 
-        self.assertEqual(output.getvalue(), "\033[2J\033[Hnew frame\n")
+        self.assertEqual(output.getvalue(), "new frame\n")
+
+    def test_terminal_dashboard_styles_status_and_clears_old_content(self):
+        output = io.StringIO()
+        with patch.object(output, "isatty", return_value=True), patch.object(main.sys, "stdout", output):
+            main.print_dashboard("CAMERA\ncamera_shm ACTIVE")
+        self.assertTrue(output.getvalue().startswith("\033[2J\033[H"))
+        self.assertIn("\033[32mACTIVE", output.getvalue())
+        self.assertTrue(output.getvalue().endswith("\033[J\n"))
+
+    def test_flange_pose_is_a_table_in_compact_dashboard(self):
+        ipc = FakeIpc()
+        text, _ = main.build_dashboard(ipc, None, 10., compact=True)
+        section = text.split('\nFLANGE\n')[1].split('\nTARGET\n')[0]
+        self.assertIn('X(m)', section)
+        self.assertIn('ROLL(°)', section)
+        self.assertIn('+1.100000', section)
+        self.assertIn('+2.200000', section)
+        self.assertIn('+3.300000', section)
+        self.assertNotIn('TF (4x4', section)
+        with patch.object(ipc.flange_shm, 'get_ordered_data', return_value=(None, 0)):
+            text, _ = main.build_dashboard(ipc, None, 10., compact=True)
+        section = text.split('\nFLANGE\n')[1].split('\nTARGET\n')[0]
+        self.assertIn('X(m)', section)
+        self.assertIn('--', section)
+
+    def test_compact_dashboard_keeps_eight_poses_in_a_table(self):
+        from common.shm_detection import DetectionFrame, OBJECT_DTYPE
+        objects = np.zeros(8, dtype=OBJECT_DTYPE)
+        objects['TF'] = np.eye(4)
+        objects['TF'][:, :3, 3] = [.1, -.2, .3]
+        objects['score'] = .9
+        dashboard, _ = main.build_dashboard(
+            FakeIpc(), None, 10., DetectionFrame(True, 123, 7, objects), compact=True)
+        self.assertIn('ROLL(°)', dashboard)
+        self.assertIn('P8  0.900', dashboard)
+        self.assertIn('+0.1000  -0.2000  +0.3000', dashboard)
+        self.assertNotIn('TF (4x4', dashboard)
+        self.assertNotIn('BBox', dashboard)
+        self.assertIn('count=8/8', dashboard)
+        self.assertNotIn('\033[', main.style_dashboard(dashboard))
 
     def test_dashboard_reports_rates_and_payload_summaries(self):
         ipc = FakeIpc()
@@ -105,7 +212,7 @@ class MainSupervisorTest(unittest.TestCase):
 
         self.assertRegex(dashboard, r"camera_shm\s+ACTIVE\s+30\.0 Hz\s+0\.0 s")
         self.assertIn("RGB    1280 × 720 · uint8 · 3 ch", dashboard)
-        self.assertIn("Depth  1280 × 720 · uint16 · 1 ch", dashboard)
+        self.assertIn("Depth  1280 × 720 · float32 · 1 ch", dashboard)
         self.assertRegex(dashboard, r"flange_shm\s+ACTIVE\s+100\.0 Hz\s+0\.0 s")
         self.assertIn("위치   X 1.100000  Y 2.200000  Z 3.300000 m", dashboard)
         self.assertRegex(dashboard, r"target_shm\s+ACTIVE\s+1\.0 Hz\s+0\.0 s")
@@ -152,7 +259,7 @@ class MainSupervisorTest(unittest.TestCase):
         sample = ipc.target_shm.read()
         sample.TF = transform
         frame = ipc.camera_shm.read()
-        frame.depth[0, :3, 0] = [100, 200, 300]
+        frame.depth[0, :3, 0] = [.1, .2, .3]
         with patch.object(ipc.target_shm, "read", return_value=sample), patch.object(
             ipc.camera_shm, "read", return_value=frame
         ):
@@ -165,7 +272,7 @@ class MainSupervisorTest(unittest.TestCase):
         self.assertIn("+Z (base): 1.000000  0.000000  0.000000", target_section)
         self.assertIn("XYZ (mm): 123.457  -234.568  345.679", target_section)
         self.assertIn("valid=3/921600", dashboard)
-        self.assertIn("min=100  median=200  max=300 mm", dashboard)
+        self.assertIn("min=0.1000  median=0.2000  max=0.3000 m", dashboard)
         self.assertIn("head=20", dashboard)
         self.assertIn("buffer=20/100", dashboard)
         self.assertIn("timestamp=101  seq=10  index=0", dashboard)
@@ -177,7 +284,7 @@ class MainSupervisorTest(unittest.TestCase):
         flange_section = dashboard.split("\nFLANGE\n")[1].split("\nTARGET\n")[0]
         self.assertIn("TF: no data", flange_section)
         self.assertIn("valid=0/921600", dashboard)
-        self.assertIn("min=-  median=-  max=- mm", dashboard)
+        self.assertIn("min=-  median=-  max=- m", dashboard)
 
     def test_pose_display_reports_invalid_rotation_without_hiding_matrix(self):
         transform = np.eye(4)
@@ -204,6 +311,8 @@ class MainSupervisorTest(unittest.TestCase):
                 camera_shm_name=f"camera_main_{suffix}",
                 flange_shm_name=f"flange_main_{suffix}",
                 target_shm_name=f"target_main_{suffix}",
+                detection_shm_name=f"detection_main_{suffix}",
+                tracking_shm_name=f"tracking_main_{suffix}",
                 camera_sem_name=f"/camera_main_{suffix}",
                 lock_path=str(Path(tempdir) / "supervisor.lock"),
             )
@@ -213,6 +322,8 @@ class MainSupervisorTest(unittest.TestCase):
         self.assertIsNone(ipc.camera_shm)
         self.assertIsNone(ipc.flange_shm)
         self.assertIsNone(ipc.target_shm)
+        self.assertIsNone(ipc.detection_shm)
+        self.assertIsNone(ipc.tracking_shm)
         self.assertIsNone(ipc.camera_sem)
 
     def test_installed_signal_handlers_set_shared_stop_event(self):

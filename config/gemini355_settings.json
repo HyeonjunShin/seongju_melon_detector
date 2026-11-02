@@ -1,0 +1,306 @@
+{
+  "comment": "null means the device doesn't support this property and will ignore it",
+  "api_version": {
+    "preset": 3,
+    "sdk": "2.10.6"
+  },
+  "device_info": {
+    "comment": "extra vid/pid may be added to 'compatible_devices' to share this preset across devices; ensure their properties are compatible",
+    "fw_version": "1.8.10",
+    "compatible_devices": [
+      {
+        "vid": "0x2BC5",
+        "pid": "0x080E"
+      }
+    ],
+    "name": "Orbbec Gemini 335Le"
+  },
+  "parameters": {
+    "comment": "all fields are optional; atomic groups (e.g. 'depth_ae_roi') are optional as a whole but require all child fields when present",
+    "device": {
+      "device_ptp_clock_sync": false,
+      "device_heartbeat": false,
+      "device_firmware_log": false,
+      "device_usb2_repeat_identify": null
+    },
+    "sensor_depth": {
+      "depth_preset": {
+        "name": "High Accuracy",
+        "version": ""
+      },
+      "depth_auto_exposure_priority": 0,
+      "depth_auto_exposure": false,
+      "depth_ae_max_exposure": 14741,
+      "mean_intensity_set_point": 60,
+      "depth_exposure_time": 3000,
+      "depth_gain": 16,
+      "depth_unit": 1.0,
+      "laser_state": 1,
+      "laser_power_level": 6,
+      "laser_ranging_module": false,
+      "depth_ae_roi": {
+        "left": 0,
+        "right": 847,
+        "top": 0,
+        "bottom": 529
+      },
+      "frame_interleave": {
+        "enable": false,
+        "mode": "",
+        "config_index": -1,
+        "params": []
+      },
+      "disparity_to_depth_mode": "hardware",
+      "disparity_search": {
+        "range_mode": 128,
+        "offset": 0
+      },
+      "noise_removal_filter": {
+        "hardware": {
+          "enable": true,
+          "threshold": 0.2
+        },
+        "software": {
+          "enable": false,
+          "min_difference": 256,
+          "max_size": 80
+        }
+      },
+      "post_processing_filter": [
+        {
+          "filter_name": "DecimationFilter",
+          "enable": false,
+          "decimate": 2
+        },
+        {
+          "filter_name": "ThresholdFilter",
+          "enable": false,
+          "min": 0,
+          "max": 16000
+        },
+        {
+          "filter_name": "HDRMerge",
+          "enable": false
+        },
+        {
+          "filter_name": "SequenceIdFilter",
+          "enable": false,
+          "sequenceid": 1
+        },
+        {
+          "filter_name": "SpatialFastFilter",
+          "enable": false,
+          "radius": 3
+        },
+        {
+          "filter_name": "SpatialModerateFilter",
+          "enable": false,
+          "magnitude": 1,
+          "disp_diff": 160,
+          "radius": 5
+        },
+        {
+          "filter_name": "SpatialAdvancedFilter",
+          "enable": false,
+          "magnitude": 1,
+          "alpha": 0.5,
+          "disp_diff": 160,
+          "radius": 1
+        },
+        {
+          "filter_name": "TemporalFilter",
+          "enable": false,
+          "diff_scale": 0.1,
+          "weight": 0.4
+        },
+        {
+          "filter_name": "HoleFillingFilter",
+          "enable": false,
+          "hole_filling_mode": 2
+        },
+        {
+          "filter_name": "FalsePositiveFilter",
+          "enable": false,
+          "fpEdgeBleedFilterEnable": false,
+          "fpebfROIMinXRatio": 0.0,
+          "fpebfROIMaxXRatio": 1.0,
+          "fpebfROIMinYRatio": 0.0,
+          "fpebfROIMaxYRatio": 0.6,
+          "fpebfMinBleedLength": 40,
+          "fpTextureSparsityFilterEnable": false,
+          "fptsfROIMinXRatio": 0.0,
+          "fptsfROIMaxXRatio": 1.0,
+          "fptsfROIMinYRatio": 0.0,
+          "fptsfROIMaxYRatio": 0.45,
+          "fptsfMaxNoiseLevel": 6000,
+          "fptsfMaxSpeckleSize": 1300,
+          "fpPatternAmbiguityFilterEnable": false,
+          "fppafROIMinXRatio": 0.0,
+          "fppafROIMaxXRatio": 0.99,
+          "fppafROIMinYRatio": 0.0,
+          "fppafROIMaxYRatio": 0.9,
+          "fppafMaxNoiseLevel": 6000,
+          "fppafMaxSpeckleSize": 4000,
+          "fppafMaxWidthRatio": 0.3,
+          "fppafMaxHeightRatio": 0.3,
+          "fppafTolerance": 0.15,
+          "fppafScore": 50
+        },
+        {
+          "filter_name": "DisparityTransform",
+          "enable": true,
+          "max_depth": 10000,
+          "min_depth": 100,
+          "depth_uint": 1.0
+        }
+      ],
+      "image_orientation": {
+        "flip": false,
+        "mirror": false,
+        "rotation": 0
+      }
+    },
+    "sensor_color": {
+      "color_auto_exposure_priority": 0,
+      "color_auto_exposure": false,
+      "color_denoising_level": 0,
+      "color_ae_max_exposure": 165,
+      "color_exposure_time": 80,
+      "color_gain": 16,
+      "color_brightness": 0,
+      "color_auto_white_balance": false,
+      "color_white_balance": 4000,
+      "color_sharpness": 50,
+      "color_gamma": 300,
+      "color_hue": 0,
+      "color_backlight_compensation": 3,
+      "color_contrast": 50,
+      "color_saturation": 64,
+      "color_power_line_frequency": "60Hz",
+      "color_anti_flicker": false,
+      "mjpeg_quality": null,
+      "color_preset": "Default",
+      "color_ae_roi": {
+        "left": 0,
+        "right": 639,
+        "top": 0,
+        "bottom": 399
+      },
+      "image_orientation": {
+        "flip": false,
+        "mirror": false,
+        "rotation": 0
+      },
+      "post_processing_filter": [
+        {
+          "filter_name": "DecimationFilter",
+          "enable": false,
+          "decimate": 2
+        }
+      ]
+    },
+    "sensor_left_ir": {
+      "image_orientation": {
+        "flip": false,
+        "mirror": false,
+        "rotation": 0
+      },
+      "post_processing_filter": [
+        {
+          "filter_name": "SequenceIdFilter",
+          "enable": false,
+          "sequenceid": 1
+        }
+      ]
+    },
+    "sensor_right_ir": {
+      "image_orientation": {
+        "flip": false,
+        "mirror": false,
+        "rotation": 0
+      },
+      "post_processing_filter": [
+        {
+          "filter_name": "SequenceIdFilter",
+          "enable": false,
+          "sequenceid": 1
+        }
+      ]
+    }
+  },
+  "application_config": {
+    "schema_version": 1,
+    "sensors": {
+      "Color": {
+        "stream_enabled": true,
+        "profile": {
+          "width": 848,
+          "height": 530,
+          "fps": 60,
+          "format": "MJPG"
+        },
+        "undistortion_enabled": false
+      },
+      "Depth": {
+        "stream_enabled": true,
+        "profile": {
+          "width": 848,
+          "height": 530,
+          "fps": 60,
+          "format": "Y16"
+        },
+        "undistortion_enabled": false
+      },
+      "Accel": {
+        "stream_enabled": false,
+        "profile": {
+          "sample_rate": 200.0,
+          "full_scale_range": "4g"
+        }
+      },
+      "Gyro": {
+        "stream_enabled": false,
+        "profile": {
+          "sample_rate": 200.0,
+          "full_scale_range": "1000dps"
+        }
+      },
+      "LeftIR": {
+        "stream_enabled": false,
+        "profile": {
+          "width": 848,
+          "height": 530,
+          "fps": 60,
+          "format": "Y8"
+        },
+        "undistortion_enabled": false
+      },
+      "RightIR": {
+        "stream_enabled": false,
+        "profile": {
+          "width": 848,
+          "height": 530,
+          "fps": 60,
+          "format": "Y8"
+        },
+        "undistortion_enabled": false
+      }
+    },
+    "device_decimation": {
+      "enable": false
+    },
+    "point_cloud": {
+      "enable": false,
+      "format": "DEPTH_POINT",
+      "decimation_factor": 1,
+      "align_mode": "D2C(HW)",
+      "frame_sync": true,
+      "all_frame_type_required": false,
+      "match_target_resolution": true
+    },
+    "hdr_merge": {
+      "enable": false,
+      "ir_enabled": true
+    }
+  }
+}

@@ -43,7 +43,7 @@ import numpy as np
 from common.shm_camera import CameraShm
 with CameraShm({name!r}, color_shape=(64, 96, 3), depth_shape=(64, 96, 1)) as shm:
     for value in range(1, 101):
-        shm.write(value, np.full((64, 96, 3), value, np.uint8),
+        shm.write(value, value, np.full((64, 96, 3), value, np.uint8),
                   np.full((64, 96, 1), value * 10, np.uint16))
         time.sleep(0.001)
 '''
@@ -75,7 +75,7 @@ with CameraShm({name!r}, color_shape=(64, 96, 3), depth_shape=(64, 96, 1)) as sh
             self.assertIsNone(shm.read(last_sequence_id=0))
             shm.sequence_id = 100
             for value in (1, 2, 3):
-                shm.write(value, np.full((1, 2, 3), value, np.uint8),
+                shm.write(value, value, np.full((1, 2, 3), value, np.uint8),
                           np.full((1, 2, 1), value * 10, np.uint16))
             latest = shm.read(last_sequence_id=100)
             self.assertEqual(latest.sequence_id, 103)
@@ -90,7 +90,7 @@ with CameraShm({name!r}, color_shape=(64, 96, 3), depth_shape=(64, 96, 1)) as sh
         name = f'camera_lock_{uuid4().hex}'
         with CameraShm(name, is_owner=True, color_shape=(1, 2, 3),
                        depth_shape=(1, 2, 1)) as shm:
-            for operation in ('shm.read()', 'shm.write(2)'):
+            for operation in ('shm.read()', 'shm.write(2, 2)'):
                 with self.subTest(operation=operation):
                     source = f'''
 from common.shm_camera import CameraShm
@@ -122,7 +122,7 @@ with CameraShm({name!r}, color_shape=(1, 2, 3), depth_shape=(1, 2, 1)) as shm:
         name = f'camera_snapshot_{uuid4().hex}'
         with CameraShm(name, is_owner=True, color_shape=(1, 2, 3),
                        depth_shape=(1, 2, 1)) as shm:
-            shm.write(1, np.full((1, 2, 3), 1, np.uint8),
+            shm.write(1, 1, np.full((1, 2, 3), 1, np.uint8),
                       np.full((1, 2, 1), 10, np.uint16))
             frame = shm.read()
             source = f'''
@@ -130,7 +130,7 @@ import numpy as np
 from common.shm_camera import CameraShm
 with CameraShm({name!r}, color_shape=(1, 2, 3), depth_shape=(1, 2, 1)) as shm:
     for value in (2, 3):
-        shm.write(value, np.full((1, 2, 3), value, np.uint8),
+        shm.write(value, value, np.full((1, 2, 3), value, np.uint8),
                   np.full((1, 2, 1), value * 10, np.uint16))
 '''
             subprocess.run([sys.executable, '-c', source], check=True, timeout=10)

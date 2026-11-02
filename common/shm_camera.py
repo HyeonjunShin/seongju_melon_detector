@@ -7,13 +7,26 @@ from multiprocessing import shared_memory
 from dataclasses import dataclass
 from multiprocessing.resource_tracker import unregister
 
+CAMERA_WIDTH = 848
+CAMERA_HEIGHT = 530
+COLOR_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
+DEPTH_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 1)
+
 
 @dataclass(slots=True)
 class Frame:
-    timestamp: int
+    timestamp_color: int
+    timestamp_depth: int
     color: np.ndarray
-    depth: np.ndarray
+    depth: np.ndarray  # float32 meters; SDK raw values must be scaled before write().
     sequence_id: int = 0
+    interval_color_us: float = float("nan")
+    interval_depth_us: float = float("nan")
+
+    @property
+    def timestamp(self):
+        """Keep RGB-D consumers on the existing color timestamp timebase."""
+        return self.timestamp_color
 
 
 class CameraShm:
@@ -21,8 +34,8 @@ class CameraShm:
         self,
         shm_name: str,
         is_owner: bool = False,
-        color_shape: tuple = (720, 1280, 3),
-        depth_shape: tuple = (720, 1280, 1),
+        color_shape: tuple = COLOR_SHAPE,
+        depth_shape: tuple = DEPTH_SHAPE,
     ):
         self._shm_name = shm_name
         self.is_owner = is_owner
@@ -37,14 +50,19 @@ class CameraShm:
                 ("index", np.int64),
                 ("latency", np.float64),
                 ("sequence_id", np.uint64),
+                ("camera_matrix", np.float64, (3, 3)),
+                ("distortion", np.float64, (8,)),
             ]
         )
 
         self.frame_dtype = np.dtype(
             [
-                ("timestamp", np.uint64),
+                ("timestamp_color", np.uint64),
+                ("timestamp_depth", np.uint64),
+                ("interval_color_us", np.float64),
+                ("interval_depth_us", np.float64),
                 ("color", np.uint8, color_shape),
-                ("depth", np.uint16, depth_shape),
+                ("depth", np.float32, depth_shape),
             ]
         )
 
@@ -59,6 +77,11 @@ class CameraShm:
         else:
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
             unregister(self.shm._name, "shared_memory")
+            if self.shm.size != self.total_bytes:
+                self.shm.close()
+                raise RuntimeError(
+                    "카메라 Shared Memory 크기가 다릅니다. main.py와 카메라 프로세스를 재시작하세요."
+                )
 
         self._header_arr = np.ndarray(
             (1,), dtype=self.header_dtype, buffer=self.shm.buf
@@ -66,6 +89,22 @@ class CameraShm:
         self.slots = np.ndarray(
             (1,), dtype=self.frame_dtype, buffer=self.shm.buf, offset=self.header_bytes
         )
+
+    @property
+    def intrinsics(self):
+        """Color intrinsics for aligned depth: OpenCV camera matrix and distortion."""
+        with self._frame_lock(fcntl.LOCK_SH):
+            return (
+                self._header_arr[0]["camera_matrix"].copy(),
+                self._header_arr[0]["distortion"].copy(),
+            )
+
+    @intrinsics.setter
+    def intrinsics(self, calibration):
+        matrix, distortion = calibration
+        with self._frame_lock(fcntl.LOCK_EX):
+            self._header_arr[0]["camera_matrix"] = matrix
+            self._header_arr[0]["distortion"] = distortion
 
     @property
     def shm_name(self) -> str:
@@ -120,20 +159,32 @@ class CameraShm:
 
     def write(
         self,
-        timestamp: int | np.uint64,
+        timestamp_color: int | np.uint64,
+        timestamp_depth: int | np.uint64,
         color_data: np.ndarray | None = None,
         depth_data: np.ndarray | None = None,
     ):
         # Validate shapes before touching the published frame.
         color = None if color_data is None else color_data.reshape(self.color_shape)
-        depth = (None if depth_data is None else
-                 depth_data.view(np.uint16).reshape(self.depth_shape))
+        depth = (
+            None
+            if depth_data is None
+            else depth_data.astype(np.float32, copy=False).reshape(self.depth_shape)
+        )
         with self._frame_lock(fcntl.LOCK_EX):
             # If a write fails or the writer exits midway, consumers must not
             # accept a partially updated frame as a new valid snapshot.
             self.status = False
             slot = self.slots[0]
-            slot["timestamp"] = timestamp
+            for stream, timestamp in (("color", timestamp_color), ("depth", timestamp_depth)):
+                previous = int(slot[f"timestamp_{stream}"])
+                slot[f"interval_{stream}_us"] = (
+                    int(timestamp) - previous
+                    if int(self.sequence_id) > 0 and previous > 0 and int(timestamp) >= previous
+                    else np.nan
+                )
+            slot["timestamp_color"] = timestamp_color
+            slot["timestamp_depth"] = timestamp_depth
             if color is not None:
                 slot["color"][:] = color
             if depth is not None:
@@ -155,10 +206,13 @@ class CameraShm:
                 return None
             slot = self.slots[0]
             return Frame(
-                timestamp=int(slot["timestamp"]),
+                timestamp_color=int(slot["timestamp_color"]),
+                timestamp_depth=int(slot["timestamp_depth"]),
                 color=slot["color"].copy(),
                 depth=slot["depth"].copy(),
                 sequence_id=sequence_id,
+                interval_color_us=float(slot["interval_color_us"]),
+                interval_depth_us=float(slot["interval_depth_us"]),
             )
 
     def close(self):

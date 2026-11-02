@@ -67,13 +67,14 @@ def test_visualizer():
 
             # (1280, 720) 해상도를 H, W 순서인 (720, 1280)으로 reshaping
             color_img = color_data.reshape((720, 1280, 3))
-            depth_img = depth_data.reshape((720, 1280))
+            depth_img = depth_data.reshape((720, 1280)).astype(np.float32)
+            depth_img *= depth_frame.get_depth_scale() * 0.001
 
             # 1. Color (RGB -> BGR)
             color_bgr = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
 
             # 2. Depth 시각화
-            depth_filtered = np.where((depth_img > 0) & (depth_img < 10000), depth_img, 0)
+            depth_filtered = np.where((depth_img > 0) & (depth_img < 10.0), depth_img, 0)
             depth_norm = cv2.normalize(depth_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             depth_colored = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
             depth_colored[depth_filtered == 0] = [0, 0, 0]

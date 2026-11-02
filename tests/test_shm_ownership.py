@@ -46,7 +46,7 @@ class SharedMemoryOwnershipTest(unittest.TestCase):
 import numpy as np
 from common.shm_camera import CameraShm
 shm = CameraShm({self.camera_name!r}, is_owner=False, color_shape=(1, 2, 3), depth_shape=(1, 2, 1))
-shm.write(7, np.ones((1, 2, 3), np.uint8), np.full((1, 2, 1), 9, np.uint16))
+shm.write(7, 7, np.ones((1, 2, 3), np.uint8), np.full((1, 2, 1), 9, np.uint16))
 shm.close()
 """
         )

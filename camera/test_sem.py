@@ -1,21 +1,20 @@
-import os
 import signal
 import sys
 import time
-from common.shm_camera import CameraShm
+from pathlib import Path
 import cv2
 import numpy as np
 import posix_ipc
 
-# 현재 경로 추가
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Support both python -m camera.test_sem and direct script execution.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common.shm_camera import (
+    CameraShm, CAMERA_WIDTH, CAMERA_HEIGHT, COLOR_SHAPE, DEPTH_SHAPE,
+)
 
 # 세마포어 및 공유 메모리 이름 설정 (camera_runner.py와 일치)
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"
-
-COLOR_SHAPE = (720, 1280, 3)
-DEPTH_SHAPE = (720, 1280, 1)
 
 is_running = True
 
@@ -26,8 +25,49 @@ def signal_handler(signum, frame):
     is_running = False
 
 
+def render_preview(frame, fps, scale=0.5):
+    """Downsample before color mapping; retain RGB/full-depth/near-depth layout."""
+    height, width = frame.color.shape[:2]
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    color = frame.color
+    depth = frame.depth.reshape(height, width)
+    if size != (width, height):
+        color = cv2.resize(color, size, interpolation=cv2.INTER_AREA)
+        # Nearest-neighbor preserves invalid depth and surface boundaries.
+        depth = cv2.resize(depth, size, interpolation=cv2.INTER_NEAREST)
+    color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+    width, height = size
+    grid = np.empty((height * 2, width * 2, 3), np.uint8)
+    for row, limit, label in ((0, 10., "FULL"), (1, 3., "NEAR")):
+        left = grid[row * height:(row + 1) * height, :width]
+        right = grid[row * height:(row + 1) * height, width:]
+        left[:] = color
+        filtered = np.where((depth > 0) & (depth < limit), depth, 0)
+        normalized = cv2.normalize(filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        right[:] = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+        right[filtered == 0] = 0
+        font_scale = .9 * scale
+        for image, text, ink in (
+            (left, f"COLOR ({frame.color.shape[1]}x{frame.color.shape[0]}) | FPS: {fps:.1f}", (0, 255, 0)),
+            (right, f"DEPTH {label} ({limit:g}m) | SEQ: {frame.sequence_id}", (255, 255, 255)),
+        ):
+            cv2.rectangle(image, (0, 0), (width, max(25, round(60 * scale))), (0, 0, 0), -1)
+            cv2.putText(image, text, (max(5, round(20 * scale)), max(18, round(45 * scale))),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, ink,
+                        max(1, round(2 * scale)), cv2.LINE_AA)
+    return grid
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="RGB-D preview with per-stage timing")
+    parser.add_argument("--scale", type=float, default=0.5,
+                        help="Tile scale: default .5 gives an 848x530 grid; 1 gives 1696x1060")
+    args = parser.parse_args()
+    if not 0 < args.scale <= 1:
+        parser.error("--scale must be in (0, 1]")
     global is_running
+    is_running = True
 
     # OS 종료 신호 핸들러 등록
     signal.signal(signal.SIGINT, signal_handler)
@@ -45,20 +85,22 @@ def main():
         )
     except FileNotFoundError:
         print(f"❌ [Error] Shared Memory ({SHM_NAME})를 찾을 수 없습니다.")
-        print("💡 camera_runner.py가 먼저 실행되어 있는지 확인해 주세요.")
+        print("💡 main.py 실행 후 camera_runner.py를 실행해 주세요.")
+        return
+
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
         return
 
     # 2. POSIX 세마포어 연결
     try:
         camera_sem = posix_ipc.Semaphore(SEM_NAME)
-    except posix_ipc.ExistError:
+    except posix_ipc.ExistentialError:
         print(f"❌ [Error] Semaphore ({SEM_NAME})를 찾을 수 없습니다.")
         camera_shm.close()
         return
 
-    window_name = "Orbbec Gemini336 - Live Preview (Color & Depth)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1280, 720)
+    window_name = "Gemini - Live Preview (Color & Depth)"
 
     print("🚀 [Test Consumer] 구동 성공! 카메라 데이터 대기 중...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -66,117 +108,55 @@ def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     real_frame_count = 0
-    start_time = time.time()
+    start_time = time.perf_counter()
+    fps = 0.
+    timings = dict(wait=0., shm=0., render=0., gui=0.)
+    skipped = 0
     last_sequence_id = 0
 
     try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, round(CAMERA_WIDTH * args.scale) * 2,
+                         round(CAMERA_HEIGHT * args.scale) * 2)
         while is_running:
-            # 💡 카메라 프로세스 신호 대기 (CPU 점유율 0%)
+            waiting = time.perf_counter()
             try:
-                camera_sem.acquire(timeout=1.0)
+                camera_sem.acquire(timeout=0.1)
             except posix_ipc.BusyError:
+                timings['wait'] += (time.perf_counter() - waiting) * 1000
+                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
                 continue
 
-            # 💡 [제품 조건 1] 카메라 프로세스/하드웨어 정상 동작 가드
+            reading = time.perf_counter()
+            timings['wait'] += (reading - waiting) * 1000
             frame = camera_shm.read(last_sequence_id=last_sequence_id)
+            rendering = time.perf_counter()
+            timings['shm'] += (rendering - reading) * 1000
             if frame is None:
                 continue
+            if last_sequence_id:
+                skipped += max(0, frame.sequence_id - last_sequence_id - 1)
             last_sequence_id = frame.sequence_id
-
-            color_data = frame.color
-            depth_data = frame.depth
-
-            # (720, 1280) Reshaping
-            color_img = color_data.reshape((720, 1280, 3))
-            depth_img = depth_data.reshape((720, 1280))
-
-            # 1. Color (RGB -> BGR)
-            color_bgr = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
-
-            # 2-1. 상단 Depth (전체 스케일: 0 ~ 10m)
-            depth_top_filtered = np.where(
-                (depth_img > 0) & (depth_img < 10000), depth_img, 0
-            )
-            depth_top_norm = cv2.normalize(
-                depth_top_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-            )
-            depth_top_colored = cv2.applyColorMap(depth_top_norm, cv2.COLORMAP_JET)
-            depth_top_colored[depth_top_filtered == 0] = [0, 0, 0]
-
-            # 2-2. 하단 Depth (근거리 서보 정밀 스케일: 0 ~ 3m)
-            depth_bot_filtered = np.where(
-                (depth_img > 0) & (depth_img < 3000), depth_img, 0
-            )
-            depth_bot_norm = cv2.normalize(
-                depth_bot_filtered, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-            )
-            depth_bot_colored = cv2.applyColorMap(depth_bot_norm, cv2.COLORMAP_JET)
-            depth_bot_colored[depth_bot_filtered == 0] = [0, 0, 0]
-
-            # 실제 유효 FPS 계산 (새 프레임 수신 건수 기반)
-            real_frame_count += 1
-            elapsed_time = time.time() - start_time
-            fps = real_frame_count / elapsed_time if elapsed_time > 0 else 0
-
-            # 텍스트 오버레이 박스 적용 (SEQ 정보 표시 추가)
-            color_bgr_top = color_bgr.copy()
-            cv2.rectangle(color_bgr_top, (10, 10), (580, 60), (0, 0, 0), -1)
-            cv2.putText(
-                color_bgr_top,
-                f"COLOR (1280x720) | FPS: {fps:.1f}",
-                (20, 45),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.rectangle(depth_top_colored, (10, 10), (750, 60), (0, 0, 0), -1)
-            cv2.putText(
-                depth_top_colored,
-                f"DEPTH FULL (10m) | SEQ: {current_seq}",
-                (20, 45),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            color_bgr_bot = color_bgr.copy()
-            cv2.rectangle(color_bgr_bot, (10, 10), (580, 60), (0, 0, 0), -1)
-            cv2.putText(
-                color_bgr_bot,
-                f"COLOR (1280x720) | FPS: {fps:.1f}",
-                (20, 45),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.rectangle(depth_bot_colored, (10, 10), (750, 60), (0, 0, 0), -1)
-            cv2.putText(
-                depth_bot_colored,
-                f"DEPTH NEAR (3m) | SEQ: {current_seq}",
-                (20, 45),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            # 2x2 화면 병합
-            top_row = np.hstack((color_bgr_top, depth_top_colored))
-            bottom_row = np.hstack((color_bgr_bot, depth_bot_colored))
-            grid_2x2 = np.vstack((top_row, bottom_row))
-
+            grid_2x2 = render_preview(frame, fps, args.scale)
+            displaying = time.perf_counter()
+            timings['render'] += (displaying - rendering) * 1000
             cv2.imshow(window_name, grid_2x2)
-
             key = cv2.waitKey(1) & 0xFF
+            now = time.perf_counter()
+            timings['gui'] += (now - displaying) * 1000
+            real_frame_count += 1
+            elapsed = now - start_time
+            if elapsed >= 1.:
+                fps = real_frame_count / elapsed
+                detail = ' | '.join(f'{name}={value / real_frame_count:.2f}ms'
+                                    for name, value in timings.items())
+                print(f'[Preview] FPS={fps:.1f} | {detail} | skipped={skipped}', flush=True)
+                real_frame_count = 0
+                start_time = now
+                timings = dict.fromkeys(timings, 0.)
+                skipped = 0
+
             if key == ord("q") or key == 27:
                 print("\n[알림] 사용자가 시각화 종료를 요청했습니다.")
                 break

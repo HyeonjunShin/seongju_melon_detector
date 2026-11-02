@@ -6,6 +6,8 @@ import posix_ipc
 from common.shm_camera import CameraShm
 from common.shm_flange import FlangeShm
 from common.shm_target import TargetShm
+from common.shm_detection import DetectionShm, SHM_NAME as DETECTION_SHM_NAME
+from common.shm_tracking import TrackingShm, SHM_NAME as TRACKING_SHM_NAME
 
 
 class ProductIpc:
@@ -16,16 +18,22 @@ class ProductIpc:
         target_shm_name: str = "target_shm",
         camera_sem_name: str = "/camera_sem",
         lock_path: str = "/tmp/seongju_melon_detector.lock",
+        detection_shm_name: str = DETECTION_SHM_NAME,
+        tracking_shm_name: str = TRACKING_SHM_NAME,
     ):
         self.camera_shm_name = camera_shm_name
         self.flange_shm_name = flange_shm_name
         self.target_shm_name = target_shm_name
+        self.detection_shm_name = detection_shm_name
+        self.tracking_shm_name = tracking_shm_name
         self.camera_sem_name = camera_sem_name
         self.lock_path = lock_path
 
         self.camera_shm = None
         self.flange_shm = None
         self.target_shm = None
+        self.detection_shm = None
+        self.tracking_shm = None
         self.camera_sem = None
         self._lock_file = None
 
@@ -46,6 +54,8 @@ class ProductIpc:
             self.camera_shm = CameraShm(self.camera_shm_name, is_owner=True)
             self.flange_shm = FlangeShm(self.flange_shm_name, is_owner=True)
             self.target_shm = TargetShm(self.target_shm_name, is_owner=True)
+            self.detection_shm = DetectionShm(self.detection_shm_name, is_owner=True)
+            self.tracking_shm = TrackingShm(self.tracking_shm_name, is_owner=True)
             self.camera_sem = posix_ipc.Semaphore(
                 self.camera_sem_name,
                 flags=posix_ipc.O_CREX,
@@ -63,6 +73,8 @@ class ProductIpc:
             self.camera_shm_name,
             self.flange_shm_name,
             self.target_shm_name,
+            self.detection_shm_name,
+            self.tracking_shm_name,
         ):
             try:
                 stale = shared_memory.SharedMemory(name=name, create=False)
@@ -81,6 +93,10 @@ class ProductIpc:
             if resource is not None:
                 resource.status = False
 
+        for resource in (self.detection_shm, self.tracking_shm):
+            if resource is not None:
+                resource.write(0, 0, [], status=False)
+
         if self.camera_sem is not None:
             self.camera_sem.close()
             try:
@@ -89,7 +105,7 @@ class ProductIpc:
                 pass
             self.camera_sem = None
 
-        for attribute in ("target_shm", "flange_shm", "camera_shm"):
+        for attribute in ("tracking_shm", "detection_shm", "target_shm", "flange_shm", "camera_shm"):
             resource = getattr(self, attribute)
             if resource is not None:
                 resource.close()

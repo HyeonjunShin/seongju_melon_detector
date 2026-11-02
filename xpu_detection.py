@@ -342,7 +342,7 @@ class PyTorchDetector:
 
 
 def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
-    """픽셀 좌표 (u, v) 부근의 Depth 패치를 추출하여 카메라 3D 좌표 [X, Y, Z] (m 단위) 계산"""
+    """픽셀 좌표 (u, v) 부근의 미터 단위 Depth 패치를 추출하여 카메라 3D 좌표 [X, Y, Z] (m 단위) 계산"""
     h, w = depth_img.shape[:2]
     if not (0 <= u < w and 0 <= v < h):
         return None
@@ -360,8 +360,6 @@ def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
         return None
 
     z_m = float(np.median(valid_depths))
-    if z_m > 10.0:  # mm -> m 변환
-        z_m /= 1000.0
 
     # 렌즈 왜곡 보정 적용
     pixel_pt = np.array([[[u, v]]], dtype=np.float32)

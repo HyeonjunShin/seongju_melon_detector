@@ -19,6 +19,8 @@ class ProductIpcTest(unittest.TestCase):
             "camera_shm_name": f"camera_ipc_{suffix}",
             "flange_shm_name": f"flange_ipc_{suffix}",
             "target_shm_name": f"target_ipc_{suffix}",
+            "detection_shm_name": f"detection_ipc_{suffix}",
+            "tracking_shm_name": f"tracking_ipc_{suffix}",
             "camera_sem_name": f"/camera_sem_{suffix}",
         }
         self.tempdir = tempfile.TemporaryDirectory()
@@ -38,6 +40,8 @@ class ProductIpcTest(unittest.TestCase):
         self.assert_shm_missing(self.names["camera_shm_name"])
         self.assert_shm_missing(self.names["flange_shm_name"])
         self.assert_shm_missing(self.names["target_shm_name"])
+        self.assert_shm_missing(self.names["detection_shm_name"])
+        self.assert_shm_missing(self.names["tracking_shm_name"])
         with self.assertRaises(posix_ipc.ExistentialError):
             posix_ipc.Semaphore(self.names["camera_sem_name"])
 
@@ -52,6 +56,8 @@ class ProductIpcTest(unittest.TestCase):
         self.assertFalse(ipc.camera_shm.status)
         self.assertFalse(ipc.flange_shm.status)
         self.assertFalse(ipc.target_shm.status)
+        self.assertFalse(ipc.detection_shm.read().status)
+        self.assertFalse(ipc.tracking_shm.read().status)
 
         self.run_worker(
             f"""
@@ -59,9 +65,17 @@ import posix_ipc
 from common.shm_camera import CameraShm
 from common.shm_flange import FlangeShm
 from common.shm_target import TargetShm
+from common.shm_detection import DetectionShm
+from common.shm_tracking import TrackingShm
 camera = CameraShm({self.names['camera_shm_name']!r}, is_owner=False)
 flange = FlangeShm({self.names['flange_shm_name']!r}, is_owner=False)
 target = TargetShm({self.names['target_shm_name']!r}, is_owner=False)
+detections = DetectionShm({self.names['detection_shm_name']!r}, is_owner=False)
+detections.write(123, 7, [])
+detections.close()
+tracking = TrackingShm({self.names['tracking_shm_name']!r})
+tracking.write(123, 7, [])
+tracking.close()
 semaphore = posix_ipc.Semaphore({self.names['camera_sem_name']!r})
 camera.close()
 flange.close()
@@ -69,6 +83,9 @@ target.close()
 semaphore.close()
 """
         )
+
+        self.assertEqual(ipc.detection_shm.read().sequence_id, 7)
+        self.assertEqual(ipc.tracking_shm.read().sequence_id, 7)
 
         probe = shared_memory.SharedMemory(
             name=self.names["camera_shm_name"], create=False
@@ -106,6 +123,14 @@ shm.close()
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 ipc.start()
 
+        self.assert_all_missing()
+
+    def test_failure_after_detection_creation_cleans_it_up(self):
+        ipc = ProductIpc(**self.names)
+        self.ipcs.append(ipc)
+        with patch("common.ipc.posix_ipc.Semaphore", side_effect=RuntimeError("injected")):
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                ipc.start()
         self.assert_all_missing()
 
     def test_context_manager_cleans_up_resources(self):

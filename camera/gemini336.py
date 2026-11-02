@@ -7,7 +7,7 @@ from pyorbbecsdk import (
     OBSensorType,
     OBFormat,
     OBPropertyID,
-    OBAlignMode
+    OBAlignMode,
 )
 
 import numpy as np
@@ -234,6 +234,7 @@ class Gemini336:
         self.is_running = False
 
     def get_frame(self, timeout_ms=100):
+        """Return SDK frames; raw Y16 depth needs get_depth_scale() * 0.001 for meters."""
         if self.pipeline is not None and self.is_running:
             try:
                 frame = self.pipeline.wait_for_frames(timeout_ms)

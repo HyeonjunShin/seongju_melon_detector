@@ -1,348 +1,362 @@
-import os
-import ctypes
+import sys
+import time
+from pathlib import Path
+from collections import Counter
 import numpy as np
 import cv2
-import openvino as ov
-import torch
-from multiprocessing import shared_memory
-from dataclasses import dataclass
 from scipy.spatial.transform import Rotation as R
 
-from training.model import DecodeModule, Model
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from common.shm_detection import DetectionShm, OBJECT_DTYPE, MAX_OBJECTS
+from common.shm_flange import FlangeShm
+from melon_pose_nmsfree import Detector as TensorRTModel
+
+DEFAULT_ENGINE = (
+    Path(__file__).resolve().parents[1]
+    / "melon_pose_nmsfree/models/rtx5060_laptop_fp16.engine"
+)
 
 
-class BufferHeader(ctypes.Structure):
-    _fields_ = [
-        ("status", ctypes.c_bool),
-        ("index", ctypes.c_int64),
-        ("latency", ctypes.c_double),
+def depth_patch_stats(u, v, depth):
+    """Use the same window as picking; expose depth availability without guessing."""
+    from camera.test_picking import PICK_PATCH_SIZE
+
+    h, w = depth.shape
+    if not (0 <= u < w and 0 <= v < h):
+        return dict(valid=0, total=0, median_m=None)
+    half = PICK_PATCH_SIZE // 2
+    patch = depth[
+        max(0, v - half) : min(h, v + half + 1), max(0, u - half) : min(w, u + half + 1)
     ]
+    valid = patch[(patch > 0) & np.isfinite(patch)]
+    return dict(
+        valid=int(valid.size),
+        total=int(patch.size),
+        median_m=float(np.median(valid)) if valid.size else None,
+    )
 
 
-@dataclass
-class TrackObj:
-    timestamp: int
-    detected: bool
-    score: float
-    bbox: np.ndarray  # [x1, y1, x2, y2]
-    centroid: np.ndarray  # [X, Y, Z] (3D m 단위, Body Keypoint 중심)
-    rotation: np.ndarray  # [qx, qy, qz, qw] (Body -> Knot 방향 쿼터니언)
+def build_base_detections(
+    predictions, depth, matrix, distortion, base_from_flange, diagnostics=None
+):
+    """Picking Body position/+Z normal; +X follows Body-to-Knot in the tangent plane."""
+    from camera.test_picking import (
+        pixel_to_camera_xyz,
+        estimate_surface_normal,
+        build_target_tf,
+        T_FLANGE_CAMERA,
+    )
 
-
-class DetectionEMA:
-    def __init__(self, alpha=0.3):
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError("alpha must be in the range (0, 1]")
-        self.alpha = alpha
-        self.bbox = None
-        self.keypoints = None
-
-    def update(self, score, bbox, keypoints, visibility):
-        if bbox is None or keypoints is None:
-            self.bbox = None
-            self.keypoints = None
-            return score, bbox, keypoints, visibility
-
-        bbox = np.asarray(bbox, dtype=np.float32)
-        keypoints = np.asarray(keypoints, dtype=np.float32)
-        if self.bbox is None:
-            self.bbox = bbox.copy()
-            self.keypoints = keypoints.copy()
-        else:
-            self.bbox = self.alpha * bbox + (1.0 - self.alpha) * self.bbox
-            self.keypoints = (
-                self.alpha * keypoints + (1.0 - self.alpha) * self.keypoints
-            )
-        return score, self.bbox.copy(), self.keypoints.copy(), visibility
-
-
-class DetectorBuffer:
-    def __init__(
-        self,
-        shm_name: str,
-        is_owner: bool = False,
+    if not (
+        np.isfinite(matrix).all()
+        and np.isfinite(distortion).all()
+        and matrix[0, 0] > 0
+        and matrix[1, 1] > 0
+        and np.isfinite(base_from_flange).all()
     ):
-        self.shm_name = shm_name
-        self.is_owner = is_owner
-
-        # Header: status(bool_ 1 byte -> 8 byte alignment) + write_index(int64 8 bytes)
-        self.header_bytes = 8 + 8
-
-        # Slot Layout (Bytes)
-        self.timestamp_bytes = np.dtype(np.uint64).itemsize  # 8
-        self.detected_bytes = np.dtype(np.bool_).itemsize  # 1
-        self.detected_pad_bytes = 7  # 8byte alignment 패딩
-        self.score_bytes = np.dtype(np.float64).itemsize  # 8
-        self.bbox_bytes = np.dtype(np.float64).itemsize * 4  # 32
-        self.centroid_bytes = np.dtype(np.float64).itemsize * 3  # 24
-        self.rotation_bytes = np.dtype(np.float64).itemsize * 4  # 32
-
-        self.slot_bytes = (
-            self.timestamp_bytes
-            + self.detected_bytes
-            + self.detected_pad_bytes
-            + self.score_bytes
-            + self.bbox_bytes
-            + self.centroid_bytes
-            + self.rotation_bytes
-        )  # Total: 136 bytes
-
-        self.total_bytes = self.header_bytes + (2 * self.slot_bytes)
-
-        if self.is_owner:
-            try:
-                old_shm = shared_memory.SharedMemory(name=self.shm_name)
-                old_shm.close()
-                old_shm.unlink()
-            except FileNotFoundError:
-                pass
-            self.shm = shared_memory.SharedMemory(
-                name=self.shm_name,
-                create=True,
-                size=self.total_bytes,
-            )
-        else:
-            self.shm = shared_memory.SharedMemory(name=self.shm_name, create=False)
-
-        # Header Mapping
-        self.status_arr = np.ndarray(
-            (1,), dtype=np.bool_, buffer=self.shm.buf, offset=0
-        )
-        self.write_index_arr = np.ndarray(
-            (1,), dtype=np.int64, buffer=self.shm.buf, offset=8
-        )
-
-        # Double Buffer Slots Mapping
-        self.slots = []
-        for i in range(2):
-            slot_offset = self.header_bytes + (i * self.slot_bytes)
-
-            timestamp_arr = np.ndarray(
-                (1,), dtype=np.uint64, buffer=self.shm.buf, offset=slot_offset
-            )
-
-            offset_curr = slot_offset + self.timestamp_bytes
-            detected_arr = np.ndarray(
-                (1,), dtype=np.bool_, buffer=self.shm.buf, offset=offset_curr
-            )
-
-            offset_curr += self.detected_bytes + self.detected_pad_bytes
-            score_arr = np.ndarray(
-                (1,), dtype=np.float64, buffer=self.shm.buf, offset=offset_curr
-            )
-
-            offset_curr += self.score_bytes
-            bbox_arr = np.ndarray(
-                (4,), dtype=np.float64, buffer=self.shm.buf, offset=offset_curr
-            )
-
-            offset_curr += self.bbox_bytes
-            centroid_arr = np.ndarray(
-                (3,), dtype=np.float64, buffer=self.shm.buf, offset=offset_curr
-            )
-
-            offset_curr += self.centroid_bytes
-            rotation_arr = np.ndarray(
-                (4,), dtype=np.float64, buffer=self.shm.buf, offset=offset_curr
-            )
-
-            self.slots.append(
-                {
-                    "timestamp": timestamp_arr,
-                    "detected": detected_arr,
-                    "score": score_arr,
-                    "bbox": bbox_arr,
-                    "centroid": centroid_arr,
-                    "rotation": rotation_arr,
-                }
-            )
-
-    def write(
-        self,
-        timestamp: int,
-        detected: bool,
-        score: float = 0.0,
-        bbox: np.ndarray = None,
-        centroid: np.ndarray = None,
-        rotation: np.ndarray = None,
+        return np.empty(0, dtype=OBJECT_DTYPE)
+    depth = depth.reshape(depth.shape[:2])
+    objects = []
+    for score, bbox, kpts, visibility in sorted(
+        predictions, key=lambda p: p[0], reverse=True
     ):
-        if bbox is None:
-            bbox = np.zeros((4,), dtype=np.float64)
-        if centroid is None:
-            centroid = np.zeros((3,), dtype=np.float64)
-        if rotation is None:
-            rotation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-
-        current_idx = int(self.write_index_arr[0])
-        next_idx = 1 - current_idx
-        target_slot = self.slots[next_idx]
-
-        target_slot["timestamp"][0] = timestamp
-        target_slot["detected"][0] = detected
-        target_slot["score"][0] = score
-
-        np.copyto(target_slot["bbox"], bbox.reshape(-1))
-        np.copyto(target_slot["centroid"], centroid.reshape(-1))
-        np.copyto(target_slot["rotation"], rotation.reshape(-1))
-
-        self.write_index_arr[0] = next_idx
-
-    def get_latest_detection(self) -> TrackObj:
-        current_idx = int(self.write_index_arr[0])
-        slot = self.slots[current_idx]
-
-        return TrackObj(
-            timestamp=int(slot["timestamp"][0]),
-            detected=bool(slot["detected"][0]),
-            score=float(slot["score"][0]),
-            bbox=slot["bbox"].copy(),
-            centroid=slot["centroid"].copy(),
-            rotation=slot["rotation"].copy(),
+        detail = dict(bbox=np.asarray(bbox).copy(), reason="invalid_prediction")
+        if diagnostics is not None:
+            diagnostics.append(detail)
+        if (
+            not np.isfinite(score)
+            or not np.isfinite(bbox).all()
+            or not np.isfinite(kpts).all()
+            or not np.isfinite(visibility).all()
+        ):
+            continue
+        if np.any(visibility < 0.5):
+            detail["reason"] = "keypoint_visibility"
+            continue
+        u, v = np.rint(kpts[0]).astype(int)
+        if diagnostics is not None:
+            detail["body_depth"] = depth_patch_stats(u, v, depth)
+        xyz = pixel_to_camera_xyz(u, v, depth, matrix, distortion)
+        if xyz is None:
+            detail["reason"] = "no_body_depth"
+            continue
+        normal_info = {} if diagnostics is not None else None
+        normal = estimate_surface_normal(
+            u, v, depth, matrix, distortion, diagnostics=normal_info
         )
-
-    def set_status(self, is_good: bool):
-        self.status_arr[0] = is_good
-
-    def get_status(self) -> bool:
-        return bool(self.status_arr[0])
-
-    def close(self):
-        del self.slots
-        del self.status_arr
-        del self.write_index_arr
-
-        import gc
-
-        gc.collect()
-
-        self.shm.close()
-        if self.is_owner:
-            try:
-                self.shm.unlink()
-            except FileNotFoundError:
-                pass
+        if normal_info is not None:
+            detail["normal"] = normal_info
+        if normal is None:
+            detail["reason"] = "normal_" + (
+                normal_info["reason"] if normal_info is not None else "rejected"
+            )
+            continue
+        z_axis = normal / np.linalg.norm(normal)
+        # Lift the IMAGE direction into the Body tangent plane. Knot depth is
+        # neither sampled nor assumed: +X lies in both the Body tangent plane
+        # and the viewing plane through the Body/Knot camera rays.
+        knot_ray_xy = cv2.undistortPoints(
+            np.asarray(kpts[1], dtype=np.float64).reshape(1, 1, 2), matrix, distortion
+        ).reshape(2)
+        body_ray = xyz / xyz[2]
+        knot_ray = np.r_[knot_ray_xy, 1.0]
+        viewing_normal = np.cross(body_ray, knot_ray)
+        x_axis = np.cross(viewing_normal, z_axis)
+        x_length = np.linalg.norm(x_axis)
+        if not np.isfinite(x_length) or x_length < 1e-9:
+            detail["reason"] = "undefined_body_knot_axis"
+            continue
+        x_axis /= x_length
+        projected_direction = x_axis[:2] - body_ray[:2] * x_axis[2]
+        alignment = np.dot(projected_direction, knot_ray[:2] - body_ray[:2])
+        if not np.isfinite(alignment) or abs(alignment) < 1e-12:
+            detail["reason"] = "undefined_body_knot_axis"
+            continue
+        if alignment < 0:
+            x_axis = -x_axis
+        y_axis = np.cross(z_axis, x_axis)
+        rotation_camera = np.column_stack((x_axis, y_axis, z_axis))
+        transform = build_target_tf(xyz, base_from_flange, normal)
+        transform[:3, :3] = (
+            base_from_flange[:3, :3] @ T_FLANGE_CAMERA[:3, :3] @ rotation_camera
+        )
+        detail["reason"] = "ok"
+        objects.append((score, bbox, transform))
+        if len(objects) == MAX_OBJECTS:
+            break
+    return np.array(objects, dtype=OBJECT_DTYPE)
 
 
 class Detector:
-    def __init__(
-        self, model_path: str = "./model_int8.xml", conf_threshold: float = 0.25
-    ):
-        self.model_path = model_path
+    """TensorRT adapter; RGB input, original-pixel outputs, Body then Knot."""
+
+    def __init__(self, model_path=DEFAULT_ENGINE, conf_threshold=0.3):
+        if not 0 <= conf_threshold <= 1:
+            raise ValueError("confidence must be in [0, 1]")
+        self.model_path = Path(model_path)
         self.conf_threshold = conf_threshold
+        self.engine = TensorRTModel(self.model_path)
+        minimum = self.engine.metadata["confidence"]
+        if conf_threshold < minimum:
+            raise ValueError(
+                f"confidence must be >= engine's fixed threshold {minimum}"
+            )
+        print(f"TensorRT 모델 로드 완료: {self.model_path}")
 
-        core = ov.Core()
-        device_name = "GPU" if "GPU" in core.available_devices else "CPU"
-        print(f"📦 OpenVINO Pose INT8 모델 로드 중... [디바이스: {device_name}]")
-
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(1, "Not found the model file.", self.model_path)
-
-        ov_model = core.read_model(self.model_path)
-        self.compiled_model = core.compile_model(ov_model, device_name)
-
-        # PrePostProcessor가 전처리를 완료한 포즈 모델의 출력 바인딩
-        self.output_scores_o2m = self.compiled_model.output(0)  # [1, 5040, 1]
-        self.output_bboxes_o2m = self.compiled_model.output(1)  # [1, 5040, 4]
-        self.output_kpts_o2m = self.compiled_model.output(2)  # [1, 5040, 2, 2]
-        self.output_vis_o2m = self.compiled_model.output(3)  # [1, 5040, 2]
-
-        self.output_scores_o2o = self.compiled_model.output(4)  # [1, 5040, 1]
-        self.output_bboxes_o2o = self.compiled_model.output(5)  # [1, 5040, 4]
-        self.output_kpts_o2o = self.compiled_model.output(6)  # [1, 5040, 2, 2]
-        self.output_vis_o2o = self.compiled_model.output(7)  # [1, 5040, 2]
+    def detect_all(self, color_img):
+        """Return all (score, bbox, keypoints, visibility) above the threshold."""
+        objects = self.engine(cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR))
+        return [
+            (
+                float(obj["score"]),
+                np.asarray(obj["bbox"], dtype=np.float32),
+                np.asarray([obj["body"], obj["knot"]], dtype=np.float32),
+                np.asarray(obj["visibility_probability"], dtype=np.float32),
+            )
+            for obj in objects
+            if obj["score"] >= self.conf_threshold
+        ]
 
     def detect(self, color_img):
-        """color_img: (720, 1280, 3) Raw Camera Frame (u8, NHWC)
-        PrePostProcessor가 내장되어 있으므로 원본 1280x720 프레임을 바로 주입합니다.
-        """
-        input_tensor = color_img[None, ...]  # [1, 720, 1280, 3]
-        results = self.compiled_model({0: input_tensor})
-
-        # scores = results[self.output_scores][0].squeeze(-1)  # [5040]
-        # bboxes = results[self.output_bboxes][0]  # [5040, 4]
-        # kpts = results[self.output_kpts][0]  # [5040, 2, 2]
-        # vis = results[self.output_vis][0]  # [5040, 2, 2]
-
-        # scores = results[self.output_scores_o2m][0].squeeze(-1)  # [5040]
-        # bboxes = results[self.output_bboxes_o2m][0]  # [5040, 4]
-        # kpts = results[self.output_kpts_o2m][0]  # [5040, 2, 2]
-        # vis = results[self.output_vis_o2m][0]  # [5040, 2, 2]
-
-        scores = results[self.output_scores_o2o][0].squeeze(-1)  # [5040]
-        bboxes = results[self.output_bboxes_o2o][0]  # [5040, 4]
-        kpts = results[self.output_kpts_o2o][0]  # [5040, 2, 2]
-        vis = results[self.output_vis_o2o][0]  # [5040, 2]
-
-        # NMS-Free 방식: 가장 점수가 높은 Top-1 앵커 선택
-        best_idx = np.argmax(scores)
-        best_score = scores[best_idx]
-
-        if best_score < self.conf_threshold:
+        """Return (score, bbox[4], keypoints[2,2], visibility probabilities[2])."""
+        objects = self.engine(cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR))
+        if not objects:
             return 0.0, None, None, None
-
-        best_bbox = bboxes[best_idx]  # [x1, y1, x2, y2]
-        best_kpt = kpts[best_idx]  # [[body_x, body_y], [knot_x, knot_y]]
-        best_vis = vis[best_idx]  # [body_visibility, knot_visibility]
-
-        return float(best_score), best_bbox, best_kpt, best_vis
-
-
-def prepare_pytorch_input(color_img, device):
-    resized = cv2.resize(color_img, (640, 360), interpolation=cv2.INTER_LINEAR)
-    padded = cv2.copyMakeBorder(
-        resized, 12, 12, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0)
-    )
-    return (
-        torch.from_numpy(padded)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(device=device, dtype=torch.float32)
-        .div_(255.0)
-    )
-
-
-class PyTorchDetector:
-    def __init__(self, checkpoint, device=None, conf_threshold=0.25):
-        if not os.path.exists(checkpoint):
-            raise FileNotFoundError(1, "Not found the checkpoint file.", checkpoint)
-
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.conf_threshold = conf_threshold
-        self.model = Model(num_classes=1, reg_max=16, num_kpts=2).to(self.device)
-        state = torch.load(checkpoint, map_location=self.device, weights_only=False)
-        if "model" in state:
-            state = state["model"]
-        elif "model_state_dict" in state:
-            state = state["model_state_dict"]
-        self.model.load_state_dict(state)
-        self.model.eval()
-        self.decoder = DecodeModule(reg_max=16, num_kpts=2).to(self.device).eval()
-        print(f"📦 PyTorch FP32 모델 로드 완료: {checkpoint} [{self.device}]")
-
-    @torch.inference_mode()
-    def detect(self, color_img):
-        _, one2one = self.model(prepare_pytorch_input(color_img, self.device))
-        cls_logits, reg_pred, kpt_pred = one2one
-        bboxes, keypoints, vis_logits = self.decoder(reg_pred, kpt_pred)
-        scores = cls_logits[0, :, 0].sigmoid()
-        best_idx = int(scores.argmax())
-        best_score = float(scores[best_idx])
-
-        if best_score < self.conf_threshold:
+        best = max(objects, key=lambda obj: obj["score"])
+        if best["score"] < self.conf_threshold:
             return 0.0, None, None, None
-
         return (
-            best_score,
-            bboxes[0, best_idx].cpu().numpy(),
-            keypoints[0, best_idx].cpu().numpy(),
-            vis_logits[0, best_idx].sigmoid().cpu().numpy(),
+            float(best["score"]),
+            np.asarray(best["bbox"], dtype=np.float32),
+            np.asarray([best["body"], best["knot"]], dtype=np.float32),
+            np.asarray(best["visibility_probability"], dtype=np.float32),
         )
+
+
+def draw_detection(color_img, score, bbox, kpts, vis):
+    """Render original-image pixel coordinates without resizing or unpadding."""
+    return draw_detections(color_img, [(score, bbox, kpts, vis)])
+
+
+def draw_detections(color_img, predictions):
+    """Render every detection on one BGR image."""
+    display = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
+    for prediction in predictions:
+        _draw_detection(display, *prediction)
+    return display
+
+
+def format_pose_diagnostic(detail):
+    parts = [detail["reason"], f"bbox={np.asarray(detail['bbox']).tolist()}"]
+    for name in ("body",):
+        patch = detail.get(name + "_depth")
+        if patch is not None:
+            parts.append(f"{name}={patch}")
+    if "normal" in detail:
+        parts.append(f"normal={detail['normal']}")
+    return " | ".join(parts)
+
+
+def draw_pose_diagnostics(display, diagnostics):
+    """Annotate rejected poses beside their detection boxes."""
+    h, w = display.shape[:2]
+    for detail in diagnostics:
+        if detail["reason"] == "ok" or not np.isfinite(detail["bbox"]).all():
+            continue
+        x = max(0, min(int(detail["bbox"][0]), max(0, w - 410)))
+        y = max(18, min(int(detail["bbox"][3]) + 18, h - 26))
+        messages = ["Pose: " + detail["reason"]]
+        patches = []
+        for name in ("body",):
+            patch = detail.get(name + "_depth")
+            if patch is not None:
+                z = "--" if patch["median_m"] is None else f"{patch['median_m']:.3f}m"
+                patches.append(f"{name}: {z} ({patch['valid']}/{patch['total']})")
+        if patches:
+            messages.append(" | ".join(patches))
+        for row, message in enumerate(messages):
+            for color, thickness in (((0, 0, 0), 3), ((0, 200, 255), 1)):
+                cv2.putText(
+                    display,
+                    message,
+                    (x, y + row * 17),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.43,
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+    return display
+
+
+def draw_base_poses(
+    display, objects, matrix, distortion, base_from_camera, axis_length=0.05
+):
+    """Overlay the published base-frame poses; local RGB axes are 5 cm long."""
+    if base_from_camera is None or not len(objects):
+        return display
+    camera_from_base = np.linalg.inv(base_from_camera)
+    local_points = np.array(
+        [
+            [0.0, 0.0, 0.0, 1.0],
+            [axis_length, 0.0, 0.0, 1.0],
+            [0.0, axis_length, 0.0, 1.0],
+            [0.0, 0.0, axis_length, 1.0],
+        ]
+    )
+    height, width = display.shape[:2]
+    for index, obj in enumerate(objects, 1):
+        camera_from_object = camera_from_base @ obj["TF"]
+        points = (camera_from_object @ local_points.T).T[:, :3]
+        if not np.isfinite(points).all() or np.any(points[:, 2] <= 0):
+            continue
+        pixels, _ = cv2.projectPoints(
+            points, np.zeros(3), np.zeros(3), matrix, distortion
+        )
+        pixels = pixels.reshape(-1, 2)
+        if not np.isfinite(pixels).all() or np.max(np.abs(pixels)) > 1e6:
+            continue
+        pixels = np.rint(pixels).astype(int)
+        origin = tuple(pixels[0])
+        if not (0 <= origin[0] < width and 0 <= origin[1] < height):
+            continue
+        for endpoint, color, label in zip(
+            pixels[1:], ((0, 0, 255), (0, 255, 0), (255, 0, 0)), "XYZ"
+        ):
+            cv2.arrowedLine(display, origin, tuple(endpoint), color, 2, cv2.LINE_AA)
+            cv2.putText(
+                display,
+                label,
+                tuple(endpoint + [4, -4]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.circle(display, origin, 4, (255, 255, 255), -1)
+        xyz = obj["TF"][:3, 3]
+        text = f"P{index} Base(m): {xyz[0]:+.3f}, {xyz[1]:+.3f}, {xyz[2]:+.3f}"
+        text_width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
+        label_origin = (
+            max(0, min(origin[0] + 12, width - text_width - 4)),
+            max(16, min(origin[1] + 25, height - 6)),
+        )
+        cv2.putText(
+            display,
+            text,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            display,
+            text,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return display
+
+
+def _draw_detection(display, score, bbox, kpts, vis):
+    if bbox is None or kpts is None or vis is None:
+        return display
+    box = np.asarray(bbox, dtype=np.float32).reshape(4)
+    points = np.asarray(kpts, dtype=np.float32).reshape(2, 2)
+    visibility = np.asarray(vis, dtype=np.float32).reshape(2)
+    if not all(np.isfinite(value).all() for value in (box, points, visibility)):
+        return display
+    height, width = display.shape[:2]
+    x1, x2 = np.clip(box[[0, 2]], 0, width - 1).astype(int)
+    y1, y2 = np.clip(box[[1, 3]], 0, height - 1).astype(int)
+    if x2 <= x1 or y2 <= y1:
+        return display
+    cv2.rectangle(display, (x1, y1), (x2, y2), (0, 140, 255), 2)
+    cv2.putText(
+        display,
+        f"Melon {score:.2f}",
+        (x1, max(20, y1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 140, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    points = np.clip(points, [0, 0], [width - 1, height - 1]).astype(int)
+    if np.all(visibility >= 0.5):
+        cv2.line(
+            display, tuple(points[0]), tuple(points[1]), (0, 140, 255), 2, cv2.LINE_AA
+        )
+    for point, label, color, probability in zip(
+        points, ("Body", "Knot"), ((255, 0, 0), (0, 0, 255)), visibility
+    ):
+        if probability >= 0.5:
+            px, py = map(int, point)
+            cv2.circle(display, (px, py), 5, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                display,
+                f"{label} {probability:.2f}",
+                (px + 7, py - 7),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+    return display
 
 
 def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
-    """픽셀 좌표 (u, v) 부근의 Depth 패치를 추출하여 카메라 3D 좌표 [X, Y, Z] (m 단위) 계산"""
+    """픽셀 좌표 (u, v) 부근의 미터 단위 Depth 패치를 추출하여 카메라 3D 좌표 [X, Y, Z] (m 단위) 계산"""
     h, w = depth_img.shape[:2]
     if not (0 <= u < w and 0 <= v < h):
         return None
@@ -360,8 +374,6 @@ def pixel_to_3d_point(u, v, depth_img, K, DIST_COEFFS, patch_size=15):
         return None
 
     z_m = float(np.median(valid_depths))
-    if z_m > 10.0:  # mm -> m 변환
-        z_m /= 1000.0
 
     # 렌즈 왜곡 보정 적용
     pixel_pt = np.array([[[u, v]]], dtype=np.float32)
@@ -451,167 +463,230 @@ def main():
     import argparse
     import signal
     import posix_ipc
-    from common.shm_camera import CameraShm
-    from camera.gemini336 import color_shape, depth_shape
+    import torch
+    from common.shm_camera import CameraShm, COLOR_SHAPE, DEPTH_SHAPE
     from camera.camera_runner import SHM_NAME, SEM_NAME
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("openvino", "pytorch"), default="openvino")
-    parser.add_argument("--checkpoint", default="runs/dual_v2/best.pt")
-    parser.add_argument("--model", default="model_int8.xml")
-    parser.add_argument("--confidence", type=float, default=0.25)
-    parser.add_argument("--ema-alpha", type=float, default=0.3)
+    parser = argparse.ArgumentParser(
+        description="TensorRT multi-object melon detection"
+    )
+    parser.add_argument(
+        "--engine", "--model", dest="model", type=Path, default=DEFAULT_ENGINE
+    )
+    parser.add_argument("--confidence", type=float, default=0.5)
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Measure processing without OpenCV window rendering",
+    )
     args = parser.parse_args()
+    # The small CPU input copy is slower with this PC's default 20 threads.
+    # Match the serving CLI's measured thread count.
+    torch.set_num_threads(4)
 
     global is_running
+    is_running = True
 
     def signal_handler(signum, frame):
         global is_running
-        print("\n🛑 [Detection Process] 종료 신호를 수신했습니다...")
         is_running = False
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    detector = Detector(args.model, conf_threshold=args.confidence)
 
     try:
         camera_shm = CameraShm(
             shm_name=SHM_NAME,
             is_owner=False,
-            color_shape=color_shape,
-            depth_shape=depth_shape,
+            color_shape=COLOR_SHAPE,
+            depth_shape=DEPTH_SHAPE,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, RuntimeError) as exc:
         print(
-            f"❌ [Error] Shared Memory ({SHM_NAME})를 찾을 수 없습니다. camera_runner_2.py를 먼저 실행하세요."
+            f"카메라 SHM 연결 실패: {exc}. main.py 실행 후 camera_runner.py를 실행하세요."
         )
         return
-
     try:
         camera_sem = posix_ipc.Semaphore(SEM_NAME)
-    except posix_ipc.ExistError:
-        print(f"❌ [Error] Semaphore ({SEM_NAME})를 찾을 수 없습니다.")
+    except posix_ipc.ExistentialError:
         camera_shm.close()
+        print(f"Semaphore ({SEM_NAME})가 없습니다. main.py를 먼저 실행하세요.")
         return
 
-    if args.backend == "pytorch":
-        detector = PyTorchDetector(args.checkpoint, conf_threshold=args.confidence)
-    else:
-        detector = Detector(args.model, conf_threshold=args.confidence)
-    detection_ema = DetectionEMA(args.ema_alpha)
-
-    window_name = f"{args.backend.title()} Melon Detection"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-    last_sequence_id = 0
     try:
-        while is_running:
-            try:
-                camera_sem.acquire(timeout=1.0)
-            except posix_ipc.BusyError:
-                continue
-
-            if not camera_shm.status:
-                continue
-
-            current_seq = camera_shm.sequence_id
-            if current_seq <= last_sequence_id:
-                continue
-            last_sequence_id = current_seq
-
-            current_frame = camera_shm.read()
-
-            timestamp = current_frame.timestamp
-            # CameraShm uses (width, height, channels); inference expects HWC.
-            color = current_frame.color.reshape((720, 1280, 3)).copy()
-            depth = current_frame.depth.reshape((720, 1280)).copy()
-
-            score, bbox, kpts, vis = detector.detect(color)
-            score, bbox, kpts, vis = detection_ema.update(score, bbox, kpts, vis)
-
-            # The model input is 640x384: original camera pixels were halved,
-            # then 12 pixels of vertical padding were added.
-            display = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-            if bbox is not None and kpts is not None and vis is not None:
-                box = np.asarray(bbox, dtype=np.float32).reshape(4)
-                points = np.asarray(kpts, dtype=np.float32).reshape(-1, 2)
-                visibility = np.asarray(vis, dtype=np.float32).reshape(-1)
-                if (
-                    np.isfinite(box).all()
-                    and np.isfinite(points).all()
-                    and np.isfinite(visibility).all()
-                    and len(points) >= 2
-                    and len(visibility) >= 2
-                ):
-                    x1, y1, x2, y2 = box
-                    x1 = int(np.clip(x1 * 2.0, 0, 1279))
-                    x2 = int(np.clip(x2 * 2.0, 0, 1279))
-                    y1 = int(np.clip((y1 - 12.0) * 2.0, 0, 719))
-                    y2 = int(np.clip((y2 - 12.0) * 2.0, 0, 719))
-                    if x2 > x1 and y2 > y1:
-                        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 140, 255), 2)
-                        cv2.putText(
-                            display,
-                            f"Melon {score:.2f}",
-                            (x1, max(20, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 140, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                        rendered_points = []
-                        for point in points[:2]:
-                            px = int(np.clip(point[0] * 2.0, 0, 1279))
-                            py = int(np.clip((point[1] - 12.0) * 2.0, 0, 719))
-                            rendered_points.append((px, py))
-
-                        if np.all(visibility[:2] >= 0.5):
-                            cv2.line(
-                                display,
-                                rendered_points[0],
-                                rendered_points[1],
-                                (0, 140, 255),
-                                2,
-                                cv2.LINE_AA,
-                            )
-                        for point, label, color_bgr, probability in zip(
-                            rendered_points,
-                            ("Body", "Knot"),
-                            ((255, 0, 0), (0, 0, 255)),
-                            visibility[:2],
-                        ):
-                            if probability >= 0.5:
-                                cv2.circle(
-                                    display, point, 5, color_bgr, -1, cv2.LINE_AA
-                                )
-                                cv2.putText(
-                                    display,
-                                    f"{label} {probability:.2f}",
-                                    (point[0] + 7, point[1] - 7),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    color_bgr,
-                                    1,
-                                    cv2.LINE_AA,
-                                )
-
-            cv2.imshow(window_name, display)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                break
-
-    except KeyboardInterrupt:
-        print("\n[알림] Ctrl + C 입력으로 중단되었습니다.")
-
-    finally:
-        print("🛑 리소스 해제 중...")
-        cv2.destroyAllWindows()
+        flange_shm = FlangeShm(shm_name="flange_shm", is_owner=False)
+    except FileNotFoundError:
         camera_shm.close()
-        try:
-            camera_sem.close()
-        except Exception:
-            pass
-        print("✅ [Detection Process] 정상 종료되었습니다.")
+        camera_sem.close()
+        print("Flange SHM 연결 실패: main.py와 로봇 수신 프로세스를 확인하세요.")
+        return
+    try:
+        detection_shm = DetectionShm(is_owner=False)
+    except (FileNotFoundError, RuntimeError) as exc:
+        flange_shm.close()
+        camera_shm.close()
+        camera_sem.close()
+        print(f"Detection SHM 연결 실패: {exc}. main.py를 먼저 실행하세요.")
+        return
+
+    window_name = "TensorRT Melon Detection"
+    last_sequence_id = 0
+    fps = None
+    frame_count = 0
+    stats_started = time.perf_counter()
+    stage_ms = dict(wait=0.0, shm=0.0, infer=0.0, draw=0.0, gui=0.0)
+    skipped = 0
+    pose_counts = Counter()
+    pose_samples = {}
+    try:
+        if not args.no_display:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        while is_running:
+            wait_started = time.perf_counter()
+            try:
+                camera_sem.acquire(timeout=0.1)
+            except posix_ipc.BusyError:
+                detection_shm.write(0, last_sequence_id, [], status=False)
+                stage_ms["wait"] += (time.perf_counter() - wait_started) * 1000
+                if not args.no_display and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    break
+                continue
+            read_started = time.perf_counter()
+            stage_ms["wait"] += (read_started - wait_started) * 1000
+            frame = camera_shm.read(last_sequence_id=last_sequence_id)
+            inference_started = time.perf_counter()
+            stage_ms["shm"] += (inference_started - read_started) * 1000
+            if frame is None:
+                continue
+            if last_sequence_id:
+                skipped += max(0, frame.sequence_id - last_sequence_id - 1)
+            last_sequence_id = frame.sequence_id
+            predictions = detector.detect_all(frame.color)
+            matrix, distortion = camera_shm.intrinsics
+            objects = np.empty(0, dtype=OBJECT_DTYPE)
+            pose_ready = False
+            diagnostics = []
+            pose_gate = (
+                "camera_inactive"
+                if not camera_shm.status
+                else "flange_inactive" if not flange_shm.status else "invalid_flange"
+            )
+            base_from_camera = None
+            if camera_shm.status and flange_shm.status:
+                flange_pose = flange_shm.read(frame.timestamp)
+                if flange_pose.matched_ts > 0 and np.isfinite(flange_pose.TF).all():
+                    pose_ready = bool(
+                        np.isfinite(matrix).all()
+                        and np.isfinite(distortion).all()
+                        and matrix[0, 0] > 0
+                        and matrix[1, 1] > 0
+                    )
+                    pose_gate = "ready" if pose_ready else "invalid_calibration"
+                    if pose_ready:
+                        from camera.test_picking import T_FLANGE_CAMERA
+
+                        base_from_flange = flange_pose.TF.copy()
+                        base_from_camera = base_from_flange @ T_FLANGE_CAMERA
+                        objects = build_base_detections(
+                            predictions,
+                            frame.depth,
+                            matrix,
+                            distortion,
+                            base_from_flange,
+                            diagnostics=diagnostics,
+                        )
+            pose_counts.update(item["reason"] for item in diagnostics)
+            for item in diagnostics:
+                if item["reason"] != "ok":
+                    pose_samples[item["reason"]] = item
+            if not pose_ready:
+                pose_counts[pose_gate] += 1
+            detection_shm.write(
+                frame.timestamp,
+                frame.sequence_id,
+                objects,
+                status=pose_ready,
+                latency_ms=(time.perf_counter() - inference_started) * 1000,
+            )
+            # Includes inference, pose geometry and publishing robot-base results.
+            inference_ms = (time.perf_counter() - inference_started) * 1000
+            stage_ms["infer"] += inference_ms
+            draw_started = time.perf_counter()
+            key = -1
+            if not args.no_display:
+                display = draw_detections(frame.color, predictions)
+                draw_pose_diagnostics(display, diagnostics)
+                draw_base_poses(display, objects, matrix, distortion, base_from_camera)
+                fps_text = "--" if fps is None else f"{fps:.1f}"
+                cv2.rectangle(display, (8, 8), (530, 94), (20, 20, 20), -1)
+                for row, text in enumerate(
+                    (
+                        f"Process FPS: {fps_text}",
+                        f"Detection + pose: {inference_ms:.2f} ms",
+                        (
+                            f"Poses: {len(objects)}/8 | XYZ axes: R/G/B (5cm)"
+                            if pose_ready
+                            else f"Pose unavailable: {pose_gate}"
+                        ),
+                    )
+                ):
+                    cv2.putText(
+                        display,
+                        text,
+                        (18, 32 + row * 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                gui_started = time.perf_counter()
+                stage_ms["draw"] += (gui_started - draw_started) * 1000
+                cv2.imshow(window_name, display)
+                key = cv2.waitKey(1) & 0xFF
+                stage_ms["gui"] += (time.perf_counter() - gui_started) * 1000
+            frame_count += 1
+            now = time.perf_counter()
+            elapsed = now - stats_started
+            if elapsed >= 1.0:
+                fps = frame_count / elapsed
+                timings = " | ".join(
+                    f"{name}={value / frame_count:.2f}ms"
+                    for name, value in stage_ms.items()
+                )
+                print(
+                    f"[Detection] FPS={fps:.1f} | {timings} | skipped={skipped}"
+                    + " | pose="
+                    + (
+                        ", ".join(
+                            f"{key}:{value}" for key, value in pose_counts.items()
+                        )
+                        or "no_detections"
+                    ),
+                    flush=True,
+                )
+                for item in pose_samples.values():
+                    print("[Pose Detail] " + format_pose_diagnostic(item), flush=True)
+                pose_samples.clear()
+                frame_count = 0
+                stats_started = now
+                stage_ms = dict.fromkeys(stage_ms, 0.0)
+                skipped = 0
+                pose_counts.clear()
+            if key in (ord("q"), 27):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not args.no_display:
+            cv2.destroyAllWindows()
+        camera_shm.close()
+        camera_sem.close()
+        detection_shm.write(0, last_sequence_id, [], status=False)
+        detection_shm.close()
+        flange_shm.close()
+        print("검출 프로세스 리소스 정리 완료")
 
 
 if __name__ == "__main__":

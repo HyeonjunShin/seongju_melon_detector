@@ -1,41 +1,55 @@
-import os
 import time
 import signal
 import posix_ipc
-from common.shm_camera import CameraShm
-from camera.gemini336 import Gemini336
+
+from common.shm_camera import (
+    CameraShm,
+    CAMERA_WIDTH,
+    CAMERA_HEIGHT,
+    COLOR_SHAPE as SHM_COLOR_SHAPE,
+    DEPTH_SHAPE as SHM_DEPTH_SHAPE,
+)
+from camera.gemini import Gemini
 
 SEM_NAME = "/camera_sem"
 SHM_NAME = "camera_shm"
-COLOR_SHAPE = (1280, 720, 3)
-DEPTH_SHAPE = (1280, 720, 1)
+
+COLOR_SHAPE = (CAMERA_WIDTH, CAMERA_HEIGHT, 3)
+DEPTH_SHAPE = (CAMERA_WIDTH, CAMERA_HEIGHT, 1)
+
+CONFIG_PATH = "./config/gemini355_settings.json"
 
 is_running = True
 
 
 def signal_handler(signum, frame):
-    """OS 종료 신호(SIGINT, SIGTERM) 수신 시 루프 정지"""
     global is_running
-    print("\n🛑 [Camera Runner] 종료 신호를 수신했습니다. 정리 작업을 진행합니다...")
+
+    print("\n[Camera Runner] 종료 신호 수신. " "정리 작업을 시작합니다.")
+
     is_running = False
 
 
-def open_camera_ipc() -> tuple[CameraShm, posix_ipc.Semaphore]:
+def open_camera_ipc():
     try:
         camera_shm = CameraShm(
             shm_name=SHM_NAME,
             is_owner=False,
-            color_shape=COLOR_SHAPE,
-            depth_shape=DEPTH_SHAPE,
+            color_shape=SHM_COLOR_SHAPE,
+            depth_shape=SHM_DEPTH_SHAPE,
         )
+
     except FileNotFoundError as exc:
-        raise RuntimeError("main.py를 먼저 실행하세요") from exc
+        raise RuntimeError(
+            "Shared Memory가 없습니다. main.py를 먼저 실행하세요."
+        ) from exc
 
     try:
         camera_sem = posix_ipc.Semaphore(SEM_NAME)
+
     except posix_ipc.ExistentialError as exc:
         camera_shm.close()
-        raise RuntimeError("main.py를 먼저 실행하세요") from exc
+        raise RuntimeError("Semaphore가 없습니다. main.py를 먼저 실행하세요.") from exc
 
     return camera_shm, camera_sem
 
@@ -47,75 +61,114 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if hasattr(os, "sched_setaffinity"):
-        try:
-            os.sched_setaffinity(0, {0})
-        except Exception:
-            pass
-
     try:
         camera_shm, sem = open_camera_ipc()
+
     except RuntimeError as exc:
-        print(f"❌ [Camera Runner] {exc}")
+        print(f"[Camera Runner] {exc}")
         return
 
-    camera = None
     try:
         camera_shm.status = False
-        camera = Gemini336(
+
+        print("[Camera Runner] Shared Memory와 " "Semaphore 연결 완료")
+
+        with Gemini(
             color_shape=COLOR_SHAPE,
             depth_shape=DEPTH_SHAPE,
-            settings_path="./config/gemini336_settings.json",
-        )
-        print("🚀 [Camera Runner] 독립 프로세스 구동 시작 (SHM & Semaphore 연결 완료)")
+            config_path=CONFIG_PATH,
+        ) as camera:
 
-        while is_running:
-            frame = camera.get_frame()
-            if frame is None:
-                camera_shm.status = False
-                time.sleep(0.001)
-                continue
+            camera_shm.intrinsics = camera.get_color_calibration()
+            print("[Camera Runner] Gemini Pipeline 시작 완료")
 
-            color = frame.get_color_frame()
-            depth = frame.get_depth_frame()
-            if color is None or depth is None:
-                camera_shm.status = False
-                time.sleep(0.001)
-                continue
+            previous_timestamp = None
+            written_count = 0
+            last_stats_time = time.perf_counter()
 
-            timestamp = depth.get_global_timestamp_us()
-            color_data = color.get_data()
-            depth_data = depth.get_data()
+            while is_running:
 
-            # Shared Memory에 프레임 쓰기
-            camera_shm.write(timestamp, color_data, depth_data)
+                # 새 RGB-D 프레임이 들어올 때까지 대기
+                frame = camera.wait_for_new_frame(
+                    previous_timestamp=previous_timestamp,
+                    timeout=0.1,
+                )
 
-            # One pending wake-up is enough: consumers always read the latest
-            # snapshot. This channel has a single producer.
-            if sem.value == 0:
-                sem.release()
+                if frame is None:
+                    # 데이터가 없다고 매번 카메라를
+                    # 비정상 상태로 처리하지 않음.
+                    continue
 
-            time.sleep(0.001)
+                color, depth, timestamp_color, timestamp_depth = frame
+
+                # 이미 처리한 프레임이면 건너뛰기
+                if timestamp_color == previous_timestamp:
+                    continue
+
+                # Shape / 데이터 타입 확인 (초기 디버깅용)
+                # print(color.shape, color.dtype)
+                # print(depth.shape, depth.dtype)
+
+                # Shared Memory 기록
+                camera_shm.write(
+                    timestamp_color,
+                    timestamp_depth,
+                    color,
+                    depth,
+                )
+
+                # 기록 성공 후 이전 Timestamp 업데이트
+                previous_timestamp = timestamp_color
+
+                # 최초 프레임 기록 이후 데이터 준비 완료
+                camera_shm.status = True
+
+                written_count += 1
+
+                # 소비자 프로세스 알림
+                if sem.value == 0:
+                    sem.release()
+
+                # 1초마다 실제 Shared Memory 쓰기 FPS 표시
+                now = time.perf_counter()
+
+                elapsed = now - last_stats_time
+
+                if elapsed >= 1.0:
+                    write_fps = written_count / elapsed
+
+                    print(
+                        f"[Camera Runner] "
+                        f"SHM Write FPS: {write_fps:.2f} | "
+                        f"Callback Frames: {camera.received_count}"
+                    )
+
+                    written_count = 0
+                    last_stats_time = now
 
     except Exception as e:
-        print(f"❌ [Camera Runner] 실행 중 예외 발생: {e}")
+        print(f"[Camera Runner] 실행 중 오류: {e}")
+        raise
 
     finally:
-        print("🛑 [Camera Runner] 리소스 연결 해제 중...")
-        camera_shm.status = False
+        print("[Camera Runner] 리소스 정리 시작")
 
         try:
-            if camera is not None:
-                camera.stop_camera()
+            camera_shm.status = False
         except Exception as exc:
-            print(f"❌ [Camera Runner] 카메라 정지 중 예외 발생: {exc}")
-        finally:
-            try:
-                camera_shm.close()
-            finally:
-                sem.close()
+            print(f"[Warning] Status update failed: {exc}")
 
-        print("✅ [Camera Runner] 프로세스 및 자원 해제 완료")
+        try:
+            camera_shm.close()
+        except Exception as exc:
+            print(f"[Warning] SHM close failed: {exc}")
+
+        try:
+            sem.close()
+        except Exception as exc:
+            print(f"[Warning] Semaphore close failed: {exc}")
+
+        print("[Camera Runner] 종료 완료")
 
 
 if __name__ == "__main__":
