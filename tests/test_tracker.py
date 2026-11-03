@@ -46,7 +46,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(missed['last_seen'][0], 1200000)
         recovered = tracker.update(1300000, detections([.06, 0, 1]))
         self.assertEqual(recovered['track_id'][0], track_id)
-        self.assertEqual(len(tracker.update(1700000, detections())), 1)
+        self.assertEqual(len(tracker.update(1700000, detections())), 0)
         self.assertEqual(len(tracker.update(10000000, detections())), 0)
         new = tracker.update(11000000, detections([.16, 0, 1]))
         self.assertNotEqual(new['track_id'][0], track_id)
@@ -77,7 +77,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(tracker.timestamp, 1000000)
         replacement = tracker.update(1125000, detections([1.2, 0, .5]))
         self.assertEqual(len(replacement), 8)
-        self.assertEqual(replacement['observed'].sum(), 1)
+        self.assertEqual(replacement['observed'].sum(), 0)
         tracker.reset()
         new = tracker.update(500000, detections([0, 0, 1]))
         self.assertGreater(new['track_id'][0], initial['track_id'].max())
@@ -125,13 +125,13 @@ class TrackerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             predict_pose(row, 1625000, 1875000, max_age=.30)
 
-    def test_capacity_replaces_a_later_coasting_track_without_disturbing_matched_ids(self):
+    def test_capacity_preserves_unexpired_tracks(self):
         tracker = MultiObjectTracker()
         initial = tracker.update(1000000, detections(*[[i * .1, 0, .5] for i in range(8)]))
         result = tracker.update(1062500, detections(*[[i * .1, 0, .5] for i in range(7)], [1.2, 0, .5]))
         np.testing.assert_array_equal(result['track_id'][:7], initial['track_id'][:7])
-        self.assertNotIn(initial['track_id'][-1], result['track_id'])
-        self.assertEqual(result['observed'].sum(), 8)
+        np.testing.assert_array_equal(result['track_id'], initial['track_id'])
+        self.assertEqual(result['observed'].sum(), 7)
 
     def test_runtime_resets_on_clock_rollback_and_rejects_future_capture(self):
         from common.shm_detection import DetectionFrame
@@ -188,18 +188,29 @@ class TrackerTest(unittest.TestCase):
         np.testing.assert_array_equal(second['track_id'], first['track_id'])
         self.assertFalse(second['observed'][-1])
 
-    def test_confirmed_track_survives_long_camera_absence_inside_workspace(self):
+    def test_all_tracks_expire_after_ten_seconds_without_observation(self):
+        for min_hits in (1, 3):
+            tracker = MultiObjectTracker(min_hits=min_hits)
+            first = tracker.update(1000000, detections([.6, .2, .3]))
+            self.assertEqual(len(tracker.update(10999999, detections())), 1)
+            self.assertEqual(len(tracker.update(11000000, detections())), 0)
+            new = tracker.update(11062500, detections([.6, .2, .3]))
+            self.assertNotEqual(new['track_id'][0], first['track_id'][0])
+
+    def test_base_box_matches_diagonal_jitter_despite_velocity_drift(self):
         tracker = MultiObjectTracker(min_hits=1)
-        initial = tracker.update(1000000, detections([.6, .2, .3]))
-        lost = tracker.update(61000000, detections())
-        self.assertEqual(lost['track_id'][0], initial['track_id'][0])
-        self.assertFalse(lost['observed'][0])
-        self.assertEqual(lost['last_seen'][0], 1000000)
-        pose = predict_pose(lost[0], 61000000, 61002000)
-        np.testing.assert_allclose(pose[:3, 3], [.6, .2, .3])
-        recovered = tracker.update(61062500, detections([.6, .2, .3]))
-        self.assertEqual(recovered['track_id'][0], initial['track_id'][0])
-        self.assertTrue(recovered['observed'][0])
+        first = tracker.update(1000000, detections([0, 0, .5]))
+        tracker.tracks[0].state[3:] = [.5, 0, 0]
+        result = tracker.update(1500000, detections([.09, .09, .59]))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result['track_id'][0], first['track_id'][0])
+        self.assertEqual(result['last_seen'][0], 1500000)
+
+    def test_expired_track_is_not_revived(self):
+        tracker = MultiObjectTracker(min_hits=1)
+        first = tracker.update(1000000, detections([0, 0, .5]))
+        new = tracker.update(11000000, detections([0, 0, .5]))
+        self.assertNotEqual(first['track_id'][0], new['track_id'][0])
 
     def test_workspace_uses_predicted_spherical_radius_and_tentative_timeout(self):
         tracker = MultiObjectTracker(min_hits=1)
@@ -210,7 +221,7 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(len(tracker.update(4100000, detections([1., 1., 0.]))), 0)
         tracker = MultiObjectTracker()
         tracker.update(1000000, detections([0, 0, 1]))
-        self.assertEqual(len(tracker.update(2100000, detections())), 0)
+        self.assertEqual(len(tracker.update(2100000, detections())), 1)
 
     def test_stalled_input_exposes_coasting_at_now_without_corrupting_capture_epoch(self):
         from common.shm_detection import DetectionFrame
@@ -234,10 +245,10 @@ class TrackerTest(unittest.TestCase):
     def test_old_observation_allowed_but_stalled_tracker_state_rejected(self):
         tracker = MultiObjectTracker(min_hits=1)
         tracker.update(1000000, detections([0, 0, 1]))
-        row = tracker.update(61000000, detections())[0]
-        predict_pose(row, 61000000, 61002000)
+        row = tracker.update(10000000, detections())[0]
+        predict_pose(row, 10000000, 10002000)
         with self.assertRaises(ValueError):
-            predict_pose(row, 61000000, 62000000)
+            predict_pose(row, 10000000, 11000000)
 
     def test_servo_prediction_rejects_workspace_exit_even_without_age_limit(self):
         tracker = MultiObjectTracker(min_hits=1)

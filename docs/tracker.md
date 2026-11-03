@@ -22,17 +22,19 @@ The dashboard includes a TRACKER position/velocity table.
 
 Each observation is already in robot-base coordinates. A six-state Kalman filter
 estimates `[x,y,z,vx,vy,vz]` independently for each object using the actual capture
-timestamp difference, in seconds. Hungarian assignment uses Euclidean distance
-from the predicted position. The distance gate is applied before assignment;
+timestamp difference, in seconds. Hungarian assignment uses the largest absolute XYZ offset
+from the last observed robot-base position. Each axis must be within ±0.10 m
+(default), giving a 200×200 mm XY footprint and ±100 mm depth tolerance.
+The Kalman prediction still supplies filtered output and velocity. The distance gate is applied before assignment;
 unmatched dummy slots prevent impossible pairs from stealing feasible matches.
 
 Default options are starting values, not measured bounds for this installation:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--max-distance` | 0.10 m | Maximum predicted-to-measured 3D distance |
-| `--max-unseen` | 1.0 s | Timeout for unconfirmed candidates only |
-| `--workspace-radius` | 1.4 m | Base-origin sphere for confirmed ID retention |
+| `--max-distance` | 0.10 m | Matching box half-size per base-frame axis |
+| `--max-unseen` | 10.0 s | Timeout since last observation for all tracks |
+| `--workspace-radius` | 1.4 m | Base-origin sphere for all track retention |
 | `--input-timeout` | 0.30 s | Reject stale detector input without immediately forgetting IDs |
 | `--min-hits` | 3 | Consecutive observations needed to confirm a new ID |
 | `--measurement-std` | 0.005 m | Position measurement standard deviation |
@@ -51,18 +53,15 @@ noise and actual motion before tuning the noise values. Identical objects
 crossing or disappearing together can still exchange IDs; position matching
 alone cannot guarantee identity.
 
-Confirmed IDs have no age-based expiry while their predicted base position is
-inside the sphere `x²+y²+z² <= 1.4²`. This covers leaving the camera field of view.
+All tracks expire when they have not been observed for 10 seconds (including
+exactly 10 seconds), or their predicted position leaves the base-origin sphere
+`x²+y²+z² <= 1.4²`. Expiry runs before matching, so an expired identity cannot
+be revived by a new observation. New detections outside the sphere are ignored.
 Predictions use the last estimated velocity; they are not new measurements.
-A newly observed pose can correct an edge prediction before workspace removal.
-New detections outside the sphere are ignored. Tentative candidates still expire
-after max_unseen; they must meet min_hits to become persistent.
 
-With all eight slots occupied, new observations can replace unconfirmed coasting
-tracks; confirmed identities keep their slots until leaving the sphere. If eight
-persistent tracks remain inside, new object registration waits for a free slot.
-A picking controller will need an explicit completed-target removal policy when
-that control integration is implemented.
+With all eight slots occupied, existing identities keep their slots until timeout
+or workspace exit, including unconfirmed candidates. New registration waits for
+a free slot. Confirmation still requires min_hits consecutive observations.
 
 Healthy empty detection frames advance predictions at the input rate. Missing,
 inactive or stale detector input now publishes retained predictions at 20 Hz,

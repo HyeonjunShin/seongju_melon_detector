@@ -38,7 +38,7 @@ class Track:
 
 
 class MultiObjectTracker:
-    def __init__(self, max_distance=.10, max_unseen=1.0, min_hits=3,
+    def __init__(self, max_distance=.10, max_unseen=10.0, min_hits=3,
                  measurement_std=.005, acceleration_std=1., initial_velocity_std=1.,
                  input_timeout=.30, workspace_radius=1.4):
         values = (max_distance, max_unseen, measurement_std, acceleration_std, initial_velocity_std, input_timeout, workspace_radius)
@@ -66,11 +66,11 @@ class MultiObjectTracker:
         # Keep IDs monotonic within this process across loss/reset.
 
     def expire(self, timestamp):
-        """Confirmed IDs live while their predicted base position is in reach."""
+        """Remove stale tracks or tracks predicted outside the base workspace."""
         dt = max(0., (timestamp - self.timestamp) / 1e6)
         self.tracks = [t for t in self.tracks
                        if np.linalg.norm(t.state[:3] + t.state[3:] * dt) <= self.workspace_radius
-                       and (t.confirmed or (timestamp - t.last_seen) / 1e6 <= self.max_unseen)]
+                       and (timestamp - t.last_seen) / 1e6 < self.max_unseen]
 
     def motion(self, dt):
         transition = np.eye(6)
@@ -86,10 +86,7 @@ class MultiObjectTracker:
                 or not all(np.isfinite(rows[name]).all() for name in ("TF", "bbox", "score"))):
             raise ValueError("Expected finite detections and a positive increasing capture timestamp")
         dt = (timestamp - self.timestamp) / 1e6 if self.timestamp else 0.
-        # Let a new observation correct an edge-of-workspace prediction before
-        # dropping it. Tentative candidates still expire to avoid permanent noise IDs.
-        self.tracks = [t for t in self.tracks
-                       if t.confirmed or (timestamp - t.last_seen) / 1e6 <= self.max_unseen]
+        self.expire(timestamp)
         transition, process_noise = self.motion(dt)
         for track in self.tracks:
             track.state = transition @ track.state
@@ -98,9 +95,11 @@ class MultiObjectTracker:
 
         matched = set()
         if self.tracks and len(rows):
-            distances = np.linalg.norm(
-                np.array([t.state[:3] for t in self.tracks])[:, None, :]
-                - rows['TF'][None, :, :3, 3], axis=2)
+            # Match the last measured object footprint in robot-base meters.
+            # Independent axis bounds include the corners of a 200 mm box.
+            offsets = (np.array([t.pose[:3, 3] for t in self.tracks])[:, None, :]
+                       - rows['TF'][None, :, :3, 3])
+            distances = np.max(np.abs(offsets), axis=2)
             n = len(self.tracks)
             # Dummy columns allow unmatched tracks. Gate before assignment so an
             # impossible pair cannot displace two feasible matches.
@@ -136,10 +135,7 @@ class MultiObjectTracker:
             if di in matched or np.linalg.norm(rows[di]["TF"][:3, 3]) > self.workspace_radius:
                 continue
             if len(self.tracks) == MAX_OBJECTS:
-                missing = [t for t in self.tracks if not t.observed and not t.confirmed]
-                if not missing:
-                    break
-                self.tracks.remove(min(missing, key=lambda t: (t.confirmed, t.last_seen)))
+                break
             row = rows[di]
             state = np.r_[row['TF'][:3, 3], np.zeros(3)]
             covariance = np.diag([self.measurement_std ** 2] * 3
@@ -268,8 +264,8 @@ def run(tracker, stop_event):
 
 def main():
     parser = argparse.ArgumentParser(description="3D Hungarian + constant-velocity Kalman tracker")
-    parser.add_argument('--max-distance', type=float, default=.10, help='3D matching gate, meters')
-    parser.add_argument('--max-unseen', type=float, default=1.0, help='Unconfirmed candidate timeout, seconds; confirmed IDs use workspace bounds')
+    parser.add_argument('--max-distance', type=float, default=.10, help='Half-size of last-observed base-frame matching box per axis, meters')
+    parser.add_argument('--max-unseen', type=float, default=10.0, help='Timeout since last observation for all tracks, seconds')
     parser.add_argument('--workspace-radius', type=float, default=1.4, help='Robot-base sphere radius, meters')
     parser.add_argument('--input-timeout', type=float, default=.30, help='Reject stale input for control, seconds')
     parser.add_argument('--min-hits', type=int, default=3, help='Consecutive matches before confirmation')
